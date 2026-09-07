@@ -1,0 +1,19 @@
+# 核心业务依赖（基于系统 Python 3.12 venv --system-site-packages，
+# torch 2.7.1+cu126 由系统环境继承，Few-shot 示例检索直接复用 BGE-M3）
+langgraph>=1.2.0
+langchain-openai>=1.3.0
+openai>=2.26.0,<3.0.0
+sqlparse>=0.5.0
+sqlalchemy>=2.0.0
+pandas>=2.0.0
+pydantic-settings>=2.0.0
+python-dotenv>=1.0.0
+sse-starlette>=2.0.0
+fastapi>=0.115.0
+uvicorn>=0.30.0
+python-multipart>=0.0.9
+fakeredis>=2.20.0
+redis>=5.0.0
+tenacity>=8.0.0
+rich>=13.0.0
+pytest>=8.0.0

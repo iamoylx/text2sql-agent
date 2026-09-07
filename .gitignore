@@ -1,0 +1,18 @@
+# 环境与依赖
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 密钥（真实值永不入库；模板见 .env.example）
+.env
+
+# 数据（CSV 与数据库文件不入库）
+data/raw/
+data/db/
+*.db
+*.sqlite
+
+# 日志与临时
+logs/
+.tmp/
