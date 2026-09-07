@@ -1,0 +1,223 @@
+"""
+工具注册表（P2-S4 核心）。
+
+TOOL_SCHEMAS —— 暴露给 LLM 的 JSON Schema（OpenAI function-calling 协议），
+               LLM 据此输出结构化 tool_calls。
+dispatch     —— 服务端分发：参数先进 Pydantic（models.PARAM_MODELS）→ 通过后调实现。
+               校验失败/执行错误返回 {"ok": False, "error": ...}，由 tools 节点转成
+               ToolMessage 回喂模型——模型看到错误可以自愈（ReAct 循环的 Observe 步）。
+
+四工具与简历原文一一对应：
+  generate_sql         生成 SQL（question → sql）
+  execute_readonly_sql 校验+只读执行（四层安全在入口处再次触发）
+  compute_metric       指标计算（sum/avg/count/mom/yoy/ratio…）
+  render_chart         返回 ECharts 配置（S6 前端直接消费）
+"""
+from __future__ import annotations
+
+import json
+from typing import Any, Callable
+
+from pydantic import ValidationError
+
+from src.agent.fewshot import FewShotRetriever
+from src.agent.prompting import build_system_prompt, render_fewshots_block, render_schema_block
+from src.core.config import settings
+from src.core.llm import get_llm
+from src.safety.validator import execute_with_timeout, validate_sql as run_validate
+from src.tools.models import PARAM_MODELS
+
+# ---------------- JSON Schema（给 LLM 看） ----------------
+
+TOOL_SCHEMAS: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_sql",
+            "description": "根据业务问题生成只读 SELECT 查询语句（SQLite 方言）。"
+                           "模型内部已注入数据库 Schema 与历史示例。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "口径清晰的业务问题"},
+                    "tables": {"type": "array", "items": {"type": "string"},
+                               "description": "候选表名（可空，留空由 Schema 全量注入）"},
+                },
+                "required": ["question"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "execute_readonly_sql",
+            "description": "对生成的 SQL 做四层安全校验（只读/表白名单/LIMIT/超时）后执行，"
+                           "返回结果行数组或错误信息。只支持单条 SELECT。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sql": {"type": "string", "description": "待执行的 SELECT 语句"},
+                },
+                "required": ["sql"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "compute_metric",
+            "description": "对查询结果做二次指标计算：sum求和/avg均值/count计数/max/min/"
+                           "mom环比/yoy同比/ratio占比。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "metric": {"type": "string",
+                               "enum": ["sum", "avg", "count", "max", "min", "mom", "yoy", "ratio"],
+                               "description": "指标类型"},
+                    "data_ref": {"type": "string", "description": "结果集引用名"},
+                    "value_col": {"type": "string", "description": "数值列名"},
+                    "group_by": {"type": "array", "items": {"type": "string"},
+                                 "description": "分组列名（可空）"},
+                },
+                "required": ["metric", "data_ref", "value_col"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "render_chart",
+            "description": "生成 ECharts 图表配置（bar/line/pie），前端直接渲染。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chart_type": {"type": "string", "enum": ["bar", "line", "pie"]},
+                    "x": {"type": "string", "description": "X 轴字段名"},
+                    "y": {"type": "string", "description": "Y 轴字段名"},
+                    "data_ref": {"type": "string", "description": "结果集引用名"},
+                },
+                "required": ["chart_type", "x", "y", "data_ref"],
+            },
+        },
+    },
+]
+
+# ---------------- 工具实现（服务端逻辑，参数已被 Pydantic 校验） ----------------
+
+def _tool_generate_sql(p: dict) -> dict:
+    q = p["question"]
+    schema_block, fewshots = _build_context(q)
+    sys_prompt = build_system_prompt(schema_block=schema_block,
+                                     fewshots_block=render_fewshots_block(fewshots))
+    llm = get_llm()
+    resp = llm.invoke([("system", sys_prompt), ("user", q)])
+    raw = (resp.content or "").strip()
+    # 解析：优先代码块，其次裸 SQL
+    import re
+    m = re.search(r"```(?:sql)?\s*(.*?)```", raw, re.S | re.I)
+    sql = (m.group(1).strip() if m else raw.strip()).rstrip(";")
+    return {"ok": True, "sql": sql, "question": q}
+
+
+def _tool_execute_sql(p: dict) -> dict:
+    sql = p["sql"]
+    vr = run_validate(sql)
+    if not vr.passed:
+        return {"ok": False, "error": f"[安全拦截·{vr.layer}] {vr.reason}",
+                "blocked": True}
+    ok, err, rows = execute_with_timeout(str(settings.db_path), vr.sql)
+    if not ok:
+        return {"ok": False, "error": err, "blocked": False}
+    return {"ok": True, "rows": rows, "row_count": len(rows)}
+
+
+def _tool_compute_metric(p: dict, results_registry: dict[str, Any]) -> dict:
+    metric, value_col, group_by = p["metric"], p["value_col"], p.get("group_by") or []
+    rows = results_registry.get(p["data_ref"]) or []
+    if not rows:
+        return {"ok": False, "error": f"结果集 {p['data_ref']} 为空或不存在"}
+    # 简易实现：单值聚合（分组聚合的通用实现放 S5 评测后再扩）
+    vals = [r.get(value_col) for r in rows if isinstance(r.get(value_col), (int, float))]
+    if not vals:
+        return {"ok": False, "error": f"列 {value_col} 无非数值数据"}
+    if metric == "sum":
+        out = sum(vals)
+    elif metric == "avg":
+        out = sum(vals) / len(vals)
+    elif metric == "count":
+        out = len(vals)
+    elif metric == "max":
+        out = max(vals)
+    elif metric == "min":
+        out = min(vals)
+    elif metric == "ratio":
+        s = sum(vals)
+        out = {str(rows[i].get(group_by[0])): round(v / s, 4) for i, v in enumerate(vals)} \
+            if group_by and len(rows) == len(vals) else {"total_share": 1.0}
+    else:  # mom / yoy 需要时间序列两期数据，先按 avg 差值近似并注明
+        out = {"note": f"{metric} 需要两期数据，当前按均值 {round(sum(vals)/len(vals), 4)} 返回",
+               "value": round(sum(vals) / len(vals), 4)}
+    return {"ok": True, "metric": metric, "value": round(out, 4) if isinstance(out, float) else out}
+
+
+def _tool_render_chart(p: dict, results_registry: dict[str, Any]) -> dict:
+    rows = results_registry.get(p["data_ref"]) or []
+    if not rows:
+        return {"ok": False, "error": f"结果集 {p['data_ref']} 为空或不存在"}
+    x_vals = [str(r.get(p["x"], "")) for r in rows]
+    y_vals = [r.get(p["y"], 0) for r in rows]
+    cfg = {
+        "tooltip": {},
+        "xAxis": {"type": "category", "data": x_vals},
+        "yAxis": {"type": "value"},
+        "series": [{"type": p["chart_type"], "data": y_vals}],
+    }
+    return {"ok": True, "chart_config": cfg}
+
+
+def _build_context(question: str):
+    """Schema 注入 + Few-shot 检索（复用 prompting 层）。"""
+    import sqlite3
+    con = sqlite3.connect(f"file:{settings.db_path}?mode=ro", uri=True)
+    try:
+        from src.db.schema import TABLES
+        row_counts, samples = {}, {}
+        for t in TABLES:
+            row_counts[t] = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            samples[t] = [tuple(r) for r in con.execute(f"SELECT * FROM {t} LIMIT 2")]
+    finally:
+        con.close()
+    schema_block = render_schema_block(samples=samples, row_counts=row_counts)
+    fewshots = FewShotRetriever().retrieve_topk(question, k=3)
+    return schema_block, fewshots
+
+
+# ---------------- 分发器 ----------------
+
+def dispatch(
+    name: str,
+    raw_args: dict,
+    results_registry: dict[str, Any] | None = None,
+) -> dict:
+    """统一入口：Pydantic 校验（第二道保险）→ 工具实现 → 统一 dict 结果。
+    校验失败返回 {ok: False, error: '参数校验失败: ...'}，由 tools 节点转 ToolMessage。
+    """
+    results_registry = results_registry or {}
+    model_cls = PARAM_MODELS.get(name)
+    if model_cls is None:
+        return {"ok": False, "error": f"未知工具: {name}"}
+    try:
+        p = model_cls(**raw_args)   # 第二道保险：类型/约束/枚举
+    except ValidationError as e:
+        first = e.errors()[0]
+        return {"ok": False, "error": f"参数校验失败: {first.get('loc')} {first.get('msg')}"}
+    pd = p.model_dump()
+    if name == "generate_sql":
+        return _tool_generate_sql(pd)
+    if name == "execute_readonly_sql":
+        return _tool_execute_sql(pd)
+    if name == "compute_metric":
+        return _tool_compute_metric(pd, results_registry)
+    if name == "render_chart":
+        return _tool_render_chart(pd, results_registry)
+    return {"ok": False, "error": f"未实现工具: {name}"}

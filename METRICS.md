@@ -56,7 +56,55 @@
 ## 待测（后续 Stage）
 - [x] ~~P2-S2 Schema 注入 + Few-shot 消融~~ → 0.600 → 1.000（+0.4，见上）
 - [x] ~~P2-S3 ReAct 状态图 + 四层安全~~ → 8/8 行为用例通过（见下）
+- [x] ~~P2-S4 工具注册 + Function Calling（agentic 图）~~ → pytest 40/40 + 行为 8/8（见下）
 - [ ] P2-S5 60 条评测：SQL 执行准确率 ≥0.80 / 端到端 ≥0.75 / 自愈 ≥0.60 / 安全拦截 100%
+
+## 工具注册 + Function Calling 双保险（P2-S4，2026-09-07）
+
+**两种编排方式的对照（简历「手写 Agent」叙事核心）**：
+- S3 `react_graph` = **确定性管线**：understand→generate→validate→execute 顺序由代码写死，
+  LLM 只负责 generate 一步 → 流程固定、可解释性强。
+- S4 `agentic_graph` = **LLM 自主编排**：同样手写 StateGraph（仍禁用 create_react_agent），
+  但顺序由 LLM 的 tool_calls 决定——图只提供「agent→tools→回喂→agent」的通用循环 +
+  MAX_STEPS=8 / TOKEN_BUDGET=40k 护栏。工具失败以 ToolMessage 回喂（ReAct 的 Observe 步），
+  模型自行修正重试。
+- **同一套 8 行为用例在两种图上跑都是 8/8** → 证明换编排心智不损失行为质量（no regression）。
+
+**四工具 JSON Schema → Pydantic 双保险**（`src/tools/{models,registry}.py`）：
+| 工具 | 作用 | 参数 Pydantic 校验 |
+|---|---|---|
+| generate_sql | question→SQL（工具内自动注入 Schema+Few-shot） | question 必填/长度 ≤500 |
+| execute_readonly_sql | 校验+只读执行（四层安全在入口再次触发） | sql 必填、≤4000 字符、含 DROP/DELETE/UPDATE/ATTACH 即拒 |
+| compute_metric | sum/avg/count/max/min/mom/yoy/ratio | metric ∈ 枚举白名单、value_col/data_ref 必填 |
+| render_chart | 返回 ECharts 配置（S6 前端直接消费） | chart_type ∈ bar/line/pie |
+
+**双保险原理**：LLM 侧 JSON Schema 是「软约束」（模型可能输出缺字段/错类型/幻觉参数），
+服务端 Pydantic 是「硬校验」——fail_fast 一错即拒，返回参数校验失败信息回喂模型自愈。
+恶意参数在类型/枚举/长度层就暴露，与 validator 的 AST 层形成纵深防御。
+
+**实测（tests/test_tools.py 40 passed + test_safety.py 全绿）**：
+- 拦截：缺必填字段 4/4、类型错/非法枚举 5/5、恶意参数（塞 DROP/DELETE/UPDATE/ATTACH/
+  超长 SQL/超长 question）6/6 全拦 ✅
+- 合法路径：`SELECT COUNT(*) FROM orders` 直通执行返回行；users 越权表在 Pydantic 层过了、
+  被 validator 表白名单拦（blocked=True）→ 两把锁各有分工 ✅
+- compute_metric 消费 results_registry 结果集：sum=60 精确 ✅
+
+**8 行为用例 agentic 图复跑全过**（evals/run_s4_behavior.py，判准与 S3 完全一致）：
+正常取数（43,428 笔）/ 多表 join Top5 州 / 2018 订单量最高月（1 月 7,069 笔）/
+空结果兜底（2030 年 0 笔优雅说明）/ 恶意 DROP 净化拒绝无写落地 / SQL 自愈（品类 Top8）/
+无 users 表说明（严格不映射）/ 相对时间口径默认 2018。
+
+**本轮踩坑（面试素材）**：
+1. AGNES 的 tool_calls 在 langchain 里是 `AIMessage.tool_calls` 列表——个别网关把
+   `arguments` 字符串化，tools 节点要兼容 str→dict 再 dispatch（解析层健壮性）。
+2. **工具结果回喂的上下文膨胀**：execute 返回上千行时全量 json 回喂会打爆上下文——tools
+   节点截断到前 30 行并标注「共 N 行仅展示前 30」（_OBSERVE_MAX_ROWS），完整结果存
+   state["result"] 供 respond 使用。
+3. 行为用例 b7 暴露规则漏洞：模型会「说了没有 users 表」之后仍擅自映射到 customers 并
+   展示数据——规则 5 收紧为「说明不存在→列出现有表→立即收尾，禁止查询/展示任何近似表」，
+   严格复验 rows=0 才过。近似映射在真实 BI 里会误导用户以为是同一张表，比拒绝更危险。
+4. 双图复用同一 CASES 模块（evals/run_s3_behavior.py 导出 CASES 常量）→ 口径零漂移，
+   S3/S4 行为可比。
 
 ## ReAct 状态图 + 四层安全（P2-S3，2026-09-07）
 

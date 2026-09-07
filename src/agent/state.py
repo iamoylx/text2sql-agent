@@ -29,6 +29,7 @@ class SQLAgentState(TypedDict, total=False):
     analysis: str                               # 指标解读
     chart_config: dict | None                   # ECharts 配置（S6 用）
     token_cost: int                             # 累计 token
+    steps: int                                  # agentic 图：已完成 agent 轮数（步数上限防死循环）
     status: Literal["ok", "blocked", "degraded"] = "ok"
     message: str = ""                           # 给用户的最终回复
     reject_reason: str = ""                     # 安全拦截原因（留证）
