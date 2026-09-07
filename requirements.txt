@@ -1,5 +1,7 @@
 # 核心业务依赖（基于系统 Python 3.12 venv --system-site-packages，
-# torch 2.7.1+cu126 由系统环境继承，Few-shot 示例检索直接复用 BGE-M3）
+# torch 2.7.1+cu126 由系统环境继承——P2 SQL Agent 不需要本地向量模型，
+# Few-shot 示例检索用轻量 TF 关键词相似度（src/agent/fewshot.py），库规模上千后
+# 可无痛切换 BGE-M3 编码，检索器接口签名不变）
 langgraph>=1.2.0
 langchain-openai>=1.3.0
 openai>=2.26.0,<3.0.0
