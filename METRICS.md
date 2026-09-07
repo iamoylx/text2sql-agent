@@ -55,5 +55,37 @@
 
 ## 待测（后续 Stage）
 - [x] ~~P2-S2 Schema 注入 + Few-shot 消融~~ → 0.600 → 1.000（+0.4，见上）
-- [ ] P2-S3 ReAct 状态图 + 四层安全（sqlparse 表/语句白名单、LIMIT 注入、超时、只读）
+- [x] ~~P2-S3 ReAct 状态图 + 四层安全~~ → 8/8 行为用例通过（见下）
 - [ ] P2-S5 60 条评测：SQL 执行准确率 ≥0.80 / 端到端 ≥0.75 / 自愈 ≥0.60 / 安全拦截 100%
+
+## ReAct 状态图 + 四层安全（P2-S3，2026-09-07）
+
+**架构**：`src/agent/{state,nodes,react_graph}.py`，手写 add_node/add_conditional_edges
+（禁用 create_react_agent）。图：understand → generate_sql → validate_sql → execute_sql
+→(失败) self_correct 回环 / (成功或超限) respond。checkpointer=MemorySaver 支撑多轮。
+防死循环双保险：retry_count 上限 3 + token_cost 预算 40k。
+
+**四层安全（validator.py，pytest 19/19 + 攻击用例 17/17 通过）**：
+
+| 层级 | SQLite 实现 | 验证 |
+|---|---|---|
+| ① 只读 | mode=ro URI（connect.py） | DELETE 被引擎拒绝 ✅ |
+| ② 表名白名单 | sqlparse AST 提取 FROM/JOIN/子查询表名 ⊆ 9 表 | users / sqlite_master / 子查询绕过 / 逗号多表全拦 ✅ |
+| ③ 行数限制 | 无 LIMIT 自动注入 LIMIT 1000 | orders 全表 → 1000 行 ✅ |
+| ④ 语句超时 | progress_handler 每 1000 指令回调 | 百万行扫描 200ms 中断（TimeoutError）✅ |
+| + 语句类型白名单 | 仅单条 SELECT（AST 层） | DELETE/UPDATE/DROP/INSERT/拼接/INTO OUTFILE 全拦 ✅ |
+
+**8 行为用例全过**（evals/run_s3_behavior.py）：正常取数 / 多表 join / 日期边界 /
+空结果兜底（2030 年 → 0 笔优雅说明）/ 恶意请求净化（模型拒绝 DROP 只查询）/ SQL 自愈 /
+越权表拒绝（users → 拦截，不映射不编造）/ 相对时间口径默认 2018。
+
+**踩坑（面试素材）**：
+1. **AGNES 网关强制要求消息含 user 角色**——respond 节点只发 SystemMessage 报
+   `No user query found`（400），8 用例全挂；改为 SystemMessage+HumanMessage 双角色即过。
+   教训：第三方网关的隐式约束要最先摸清（P1 的空 content 是另一个网关怪癖）。
+2. understand 口径改写规则 1 会把「2030年」这类**明确年份**也吞成默认口径 2018——
+   规则只该兜底「最近/最新」相对时间；这是 Text2SQL 口径层的典型 over-normalize bug。
+3. 恶意请求行为测试的设计误区：端到端层模型会「净化」DROP 只执行 SELECT（安全但测不到
+   拦截路径）——安全层硬拦截应交给 validator 单测（17 攻击用例），端到端只验「无写操作落地」。
+4. 点名不存在表时模型倾向语义映射（users→customers）——understand 提示词加
+   「不在 Schema 的表不得擅自映射，需说明不存在」规则后正确拒绝。
