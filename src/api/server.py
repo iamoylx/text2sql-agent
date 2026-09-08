@@ -157,7 +157,6 @@ def _norm_agentic(node: str, upd: dict) -> list[dict]:
     for m in msgs:
         kind = type(m).__name__
         if kind == "AIMessage":
-            content = (getattr(m, "content", None) or "").strip()
             calls = list(getattr(m, "tool_calls", None) or [])
             if calls:
                 for c in calls:
@@ -177,9 +176,8 @@ def _norm_agentic(node: str, upd: dict) -> list[dict]:
                                        content=f"准备执行 SQL，观察结果…"))
                     elif name == "render_chart":
                         out.append(_ev("thought", step="agent:render_chart",
-                                       content="按结果生成图表…"))
-            elif content:
-                out.append(_ev("thought", step="agent", content=content[:400]))
+                                       content=f"按结果生成图表…"))
+            # 无 tool_calls 的 AIMessage 是模型自发的回答，留给 respond 节点统一吐 answer
         elif kind == "ToolMessage":
             tool = getattr(m, "name", "") or ""
             try:

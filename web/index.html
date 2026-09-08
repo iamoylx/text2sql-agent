@@ -46,12 +46,11 @@
   .tbl[open] summary::before{transform:rotate(90deg)}
   .tbl summary .cnt{font-size:11px;color:var(--ink3);font-weight:400;margin-left:auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:90px}
   .tbl .tip{font-size:11px;color:var(--ink3);padding:0 10px 6px}
-  .tbl ul{list-style:none;padding:0 8px 8px}
-  .tbl li{font-size:12px;color:var(--ink2);padding:3px 6px;border-radius:6px;cursor:default;display:flex;gap:6px}
-  .tbl li b{font-family:var(--mono);font-weight:500;color:var(--ink);white-space:nowrap}
-  .tbl li .c{color:var(--ink3);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .tbl ul{list-style:none;padding:0 6px 8px}
+  .tbl li{font-size:12px;padding:4px 8px 5px;border-radius:6px;cursor:default;margin-bottom:1px}
+  .tbl li b{font-family:var(--mono);font-weight:600;color:var(--accent);font-size:12px;display:block;letter-spacing:.2px}
+  .tbl li .c{display:block;color:var(--ink2);font-size:11.5px;margin-top:1px;line-height:1.45}
   .tbl li:hover{background:var(--accent-soft)}
-  .tbl li:hover .c{white-space:normal}
   /* 中：对话 */
   #chat{flex:1;overflow:auto;padding:6px 16px 12px}
   .msg{max-width:860px;margin:0 auto}
@@ -277,7 +276,7 @@ function handleEvent(ev, card, rows, evSeq, setSqls, setChart, setHid){
     const wrap = el("div","sqlBlock");
     const head = el("div","sqlHead", "SQL · " + (ev.step || ""));
     const cp = document.createElement("button"); cp.textContent = "复制";
-    cp.onclick = async () => { try{ await navigator.clipboard.writeText(ev.sql); cp.textContent = "已复制"; }catch(_){} };
+    cp.onclick = async e => { e.stopPropagation(); try{ await navigator.clipboard.writeText(ev.sql); cp.textContent = "已复制"; setTimeout(() => cp.textContent = "复制", 1200); }catch(_){} };
     head.appendChild(cp);
     const pre = el("pre","sql", ev.sql);
     head.addEventListener("click", () => pre.classList.toggle("open"));
