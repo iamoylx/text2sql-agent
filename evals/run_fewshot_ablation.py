@@ -77,6 +77,12 @@ def _norm_val(v):
     return v
 
 
+def _cmp_key(v):
+    """排序键归一化：先比类型名再比字符串值，杜绝 int vs str 跨类型比较崩溃
+    （混出 str+int 列的查询曾触发 TypeError；S5 修复后回填至此，保持两脚本同源）。"""
+    return (type(v).__name__, str(v))
+
+
 def compare_result(gold_sql: str, cand_sql: str) -> tuple[bool, str, list]:
     """执行两条 SQL 并比较结果集（忽略列名/列序/行序）。返回 (匹配, 错误信息, 金标行)。"""
     con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
@@ -91,9 +97,10 @@ def compare_result(gold_sql: str, cand_sql: str) -> tuple[bool, str, list]:
         con.close()
         return False, f"EXEC_ERR {type(e).__name__}: {str(e)[:80]}", gold_rows
 
-    # 忽略列序：每行按值排序后再整体排序比较（值集合同则判对）
+    # 忽略列序：行内排序 + 行间排序全部走 _cmp_key，任何一层都不直接比较原始值
     def canon(rows):
-        return sorted(tuple(sorted(r, key=lambda x: (str(x), type(x).__name__))) for r in rows)
+        inner = [tuple(sorted(r, key=_cmp_key)) for r in rows]
+        return sorted(inner, key=lambda row: tuple(_cmp_key(v) for v in row))
 
     con.close()
     if canon(gold_rows) == canon(cand_rows):

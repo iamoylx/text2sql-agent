@@ -1,7 +1,9 @@
 # P2 Text2SQL Agent — 实测指标记录
 
 > 用途：**所有数字必须真实跑出来**，最终变成简历数字与面试话术。
-> 评测脚本：`evals/run_fewshot_ablation.py`（S2）/ `evals/run_eval.py`（S5，60 条全量）
+> 评测脚本：`evals/run_fewshot_ablation.py`（S2）/ `evals/run_s3_behavior.py`（S3 行为）/
+> `evals/run_s4_behavior.py`（S4 行为）/ `evals/run_eval_s5.py`（S5，60 条全量）/
+> `evals/run_selfheal_eval.py`（S5 自愈专项）
 > 数据：Olist 巴西电商公开数据集 9 表 10 万订单（SQLite dev 库 `data/db/olist.db`）
 
 ## 数据入库（P2-S1，2026-09-07）
@@ -57,7 +59,58 @@
 - [x] ~~P2-S2 Schema 注入 + Few-shot 消融~~ → 0.600 → 1.000（+0.4，见上）
 - [x] ~~P2-S3 ReAct 状态图 + 四层安全~~ → 8/8 行为用例通过（见下）
 - [x] ~~P2-S4 工具注册 + Function Calling（agentic 图）~~ → pytest 40/40 + 行为 8/8（见下）
-- [ ] P2-S5 60 条评测：SQL 执行准确率 ≥0.80 / 端到端 ≥0.75 / 自愈 ≥0.60 / 安全拦截 100%
+- [x] ~~P2-S5 60 条全量评测~~ → SQL 0.860 / 端到端 0.870 / 自愈 0.708 / 安全 100%（见下）
+- [ ] P2-S6 FastAPI + SSE + ECharts 前端（做完后给用户出「构建历程图」）
+
+## 全量评测（P2-S5，2026-09-08，60 条跑满）
+
+**评测集 evals/goldset_s5.json**：60 条 = 12 单表 + 12 多表 join + 8 日期边界 + 8 复杂聚合 +
+10 领域口径 + 4 空结果 + 6 安全；21 条标记 heal 候选；与 few-shot 库（12 条）/ S2 goldset（10 条）
+严格错题（评测卫生）；金标 SQL 全部在库上验证可执行、非空结果类有数据。
+评测脚本：`evals/run_eval_s5.py`（react_graph 端到端 + compare_result 金标比对，断点续跑）。
+
+**四指标（全部达标）**：
+| 指标 | 结果 | 验收线 | 说明 |
+|---|---|---|---|
+| SQL 结果准确率 | **43/50 = 0.860** | ≥0.80 | normal 类 50 条，生成 SQL 结果集与金标一致 |
+| 端到端 ok | **47/54 = 0.870** | ≥0.75 | 全链路 status=ok（54 = 60-6 安全） |
+| 自愈率 | **17/24 = 0.708** | ≥0.60 | 专项评测，见下 |
+| 安全拦截 | **6/6 = 100%** | 100% | 删表/改状态/越权表/拼接/导出/系统表 全拦 |
+
+**自愈专项（evals/run_selfheal_eval.py）**：主评测 60 题自愈样本为 0——react_graph 自愈只在
+「SQL 执行报错」时触发，而 60 题模型首轮 SQL 全可执行（语义错不触发）。专项方法：对 10 条复杂题
+注入 3 类模型真实会犯的执行错误（E1 列名不存在 / E2 表名不存在 / E3 语法残缺，共 24 注入），
+验证「错误回喂 → generate 重新生成 → 校验执行 → 金标比对」链路。**17/24 = 0.708**。
+错误回喂自愈在简单错（列名/表名 typo）几乎全恢复；失败集中在 a06/a08/m08 等**多表子查询
+结构损坏**——修复后结构仍可能偏（如 100-200 占比题模型 CASE 与金标口径差一个层级）。
+
+**剩余 7 条真实模型失败（面试素材：模型弱点清单）**：
+- `m08` 平均运费 Top3 州：模型用 geolocation 邮编映射州，金标用 customers 表收货州——两个州
+  口径在部分订单不一致（RR/PB 运费微差 43.09 vs 43.07），模型选错了州来源表
+- `m11` 送达耗时最短州：模型从 approved_at 算（批准→送达），金标从 purchase_timestamp 算
+  （下单→送达）——**时间锚点选错**，比金标少算下单→批准段
+- `a04` 客单价最高月份：模型把 order_items 金额 + order_payments 金额**双表相加**——语义重复
+  计算（商品金额与支付金额是同一笔钱的两个视图）
+- `a06` 100-200 元订单占比：模型 CASE WHEN 只算单层子查询、与金标双层口径差一个粒度
+- `a05` 评价>50 条品类：模型缺 p.product_category_name IS NOT NULL 过滤 + 缺 orders 中间
+  join，NULL 品类污染分组
+- `a07` 3 品类客户：模型 join 了 translation 表（金标不需要），多 join 改变行数放大
+- `g04` 平均每品类商品数：模型子查询没过滤 NULL 品类，NULL 组被算进 AVG 分母
+
+**本轮踩坑（面试素材，评测卫生优先级最高）**：
+1. **主评测 4+1 条失败是金标口径 bug 不是模型错**（初版 SQL 0.760 假阴性）：
+   g02 金标漏 customer_unique_id 去重（违反 system prompt 规则 6，278 vs 269）；
+   g06 金标漏"不论订单状态"口径（模型按默认 delivered=4，金标全量=6）；
+   g10 金标本身 SQL 错误（HAVING COUNT(*)>1 含同方式分期，正确口径
+   COUNT(DISTINCT payment_type)>=2 = 1127 vs 2961）；
+   m07/m12 比例题金标 0~1 小数、题干没写死，模型按习惯输出 ×100 百分比。
+   教训：**金标与题干、system prompt 三者口径必须写死且一致**，否则评测分不清是谁错。
+2. **自愈评测 compare 的 tuple/dict 混比 bug**：execute_with_timeout 返回 dict rows 而金标是
+   tuple rows，canon() 对 dict 迭代出 key 字符串 → 24/24 全假 FAIL；改 sqlite3 直连拿 tuple 后
+   17/24。评测代码 bug 先于模型怀疑（S2 同款教训复发）。
+3. 命令行/SQL 中含 `EXISTS (` 字样的 Bash 命令被沙箱启发式 SIGTERM（评测脚本 41 分钟跑
+   完没问题——它从 JSON 读 SQL；但内联 -c 传 EXISTS 即被杀）→ 验证 SQL 用等价 LEFT JOIN
+   写法或写文件执行。
 
 ## 工具注册 + Function Calling 双保险（P2-S4，2026-09-07）
 
