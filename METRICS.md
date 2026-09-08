@@ -60,7 +60,41 @@
 - [x] ~~P2-S3 ReAct 状态图 + 四层安全~~ → 8/8 行为用例通过（见下）
 - [x] ~~P2-S4 工具注册 + Function Calling（agentic 图）~~ → pytest 40/40 + 行为 8/8（见下）
 - [x] ~~P2-S5 60 条全量评测~~ → SQL 0.860 / 端到端 0.870 / 自愈 0.708 / 安全 100%（见下）
-- [ ] P2-S6 FastAPI + SSE + ECharts 前端（做完后给用户出「构建历程图」）
+- [x] ~~P2-S6 FastAPI + SSE + ECharts 前端~~ → 服务化上线 + 浏览器实测（见下）
+
+## 服务化 + 前端（P2-S6，2026-09-08）
+
+**服务层**（`src/api/server.py` + `scripts/run_api.py`，端口 8501）：
+- `POST /api/query` SSE 流式：生产者线程跑 `graph.stream(stream_mode="updates")` →
+  `queue.Queue` → 异步消费者逐帧 yield（真流式，不攒完整回答）
+- 六类统一事件：thought / sql / result / chart / answer / error（+done），
+  `_norm_agentic` / `_norm_react` 把两种图的节点更新归一到同一事件协议
+- `GET /api/schema`（左栏 Schema 树）/ `GET /api/history/{id}`（事件轨迹回放）/
+  `POST /api/feedback`（👍👎 落库 `data/db/service.db`，人工标注沉淀评测样本）
+- 每次请求独立 `thread_id`：图带 MemorySaver checkpoint，固定 thread_id 会让
+  上一轮未收敛现场串到下一次查询（实测踩坑）
+
+**前端**（`web/index.html`，原生 JS 无框架，iOS 玻璃拟态三栏）：
+- 左 Schema 树（表/列/行数）/ 中对话（SQL 可折叠复制、thought chips、反馈）/
+  右结果表 + ECharts（chart 事件独立渲染）
+- `md()` 逐行块级渲染：表格占位符 → escape → 标题/列表/段落白名单标签
+- **渲染根因坑（面试素材）**：answer 气泡曾用 `textContent` 插入 md() 产出的 HTML →
+  整段标签当正文显示。改 `innerHTML`（安全成立：md() 先整体 escape 再插白名单标签）。
+  教训：前端渲染验证必须浏览器截图，字符串验证不等于 DOM 正确
+- 输出净化三层：服务端 `_strip_chart_xml`（raw+转义形态）、prompt 禁贴 ECharts 配置、
+  前端 md() 再兜一层
+
+**S6 健壮性加固（实测驱动）**：
+| 坑 | 现象 | 修法 |
+|---|---|---|
+| checkpoint 串场 | 第二次查询秒回"已达步数上限" | 每请求独立 thread_id |
+| AGNES 重复 tool_call | 同轮同参数调用成对出现，白烧步数 | tools 节点按 name+args 去重 |
+| data_ref 命名漂移（b7 复发） | 模型编 `top5_categories_2017`，注册表只有 `result` | schema 写死填 result + `_resolve_rows` 兜底 |
+| 二次指标心算 | SP 占比说 58%，真实 56.6% | prompt 禁心算占比，必须走 compute_metric |
+
+**验收**：SSE 端到端（"2017年各品类销量 Top5，用图表展示"）status=ok、0 XML 残留、
+chart 独立事件渲染；浏览器自动化截图验证表格/标题/列表真实渲染；feedback 落库验证；
+pytest 40 passed 无回归。
 
 ## 全量评测（P2-S5，2026-09-08，60 条跑满）
 
