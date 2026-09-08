@@ -78,6 +78,8 @@ _AGENTIC_SYSTEM_PROMPT = f"""你是电商数据分析 Agent。数据库是 Olist
 
 ## 收尾
 用中文给用户一段简洁结论：先说核心数字，再补关键发现。给出结论后不要再调用工具。
+占比/百分比/差值等二次指标**禁止心算**，必须先用 compute_metric（ratio/sum/avg 等）
+算出真实值再写进回答——模型心算占比经常差一两个百分点。
 图表由 render_chart 工具独立生成（前端右栏渲染），**不要在回答文本中再粘贴
 ECharts 配置或写 <echarts-config>{...}</echarts-config> 等 XML 标签**——重复且
 会被前端剔除，浪费 token。回答里只写人类可读的文字与 markdown 表格。
