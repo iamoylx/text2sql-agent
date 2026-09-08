@@ -13,16 +13,18 @@
 业务口径（默认 delivered、客户去重用 customer_unique_id、金额含运费）写死在
 system prompt，保证人人问出一致口径。
 
-## 两种编排对照（核心设计）
+## 三种编排对照（核心设计）
 
-| | react_graph（S3） | agentic_graph（S4） |
-|---|---|---|
-| 编排哲学 | **确定性管线**：understand→generate→validate→execute 顺序由代码写死 | **LLM 自主编排**：模型每轮输出 tool_calls，图只做「执行→观察→回喂」循环 |
-| 模型角色 | 只负责 generate 一步 | 自主决定调什么工具、调几轮 |
-| 适合场景 | 流程固定、可解释性优先 | 开放任务、工具组合多样 |
-| 共同护栏 | MAX_STEPS=8 + TOKEN_BUDGET=40k + 四层安全（与编排无关，双保险） | 同左 |
+| | react_graph（S3） | agentic_graph（S4） | supervisor_graph（S8） |
+|---|---|---|---|
+| 编排哲学 | **确定性管线**：understand→generate→validate→execute 顺序由代码写死 | **LLM 自主编排**：模型每轮输出 tool_calls，图只做「执行→观察→回喂」循环 | **规划-分工-裁决**：Planner 拆解 → 三个子 Agent（黑板共享、messages 隔离）→ Judge 质量门控 |
+| 模型角色 | 只负责 generate 一步 | 自主决定调什么工具、调几轮 | 子 Agent 各司其职；Judge 有否决权（fix 打回重做，revision≤2） |
+| 适合场景 | 流程固定、可解释性优先 | 开放任务、工具组合多样 | 高质量要求、可接受多次调用的成本（token 反而更低：黑板隔离上下文小） |
+| 共同护栏 | MAX_STEPS + TOKEN_BUDGET + 四层安全（与编排无关，双保险） | 同左 | 同左 + judge 两层门控（Python 硬门控 + LLM-as-Judge） |
 
-两者都手写 `add_node` / `add_conditional_edges`，共享同一套行为用例（8/8 双过证无回归）。
+三者都手写 `add_node` / `add_conditional_edges`（禁 prebuilt）。S3/S4 同一套行为用例 8/8 双过；
+S8 双跑对照：行为 7/8（唯一失败是免费额度限流）、**token -56%**、延迟 +2.8 倍（诚实代价）。
+前端「Supervisor 多智能体」按钮可现场演示判官打回循环。
 
 ## 实测指标（全部真实跑出，详见 METRICS.md）
 
@@ -35,7 +37,9 @@ system prompt，保证人人问出一致口径。
 | 安全拦截 | **6/6** | 恶意请求全拦，无写操作落地 |
 | 攻击用例 | 17/17 | AST 层单测（越权表/子查询绕过/拼接/OUTFILE） |
 | 写路径安全用例 | 18/18 | S9 HITL：三道闸 8 + dry-run 零副作用 3 + commit/审计 2 + CSV 导入 5 |
-| 服务层测试 | pytest 58 passed | 工具双保险 + 安全层 + S9 写路径（全量零回归） |
+| Supervisor 离线用例 | 5/5 | S8：FakeLLM 驱动全图（happy path / 判官打回循环 / 安全降级 / 规划纠偏） |
+| CTE 白名单用例 | 4/4 | S8 连带修复：WITH 别名不被误杀、不掩盖真越权表 |
+| 服务层测试 | pytest 67 passed | 工具双保险 + 安全层 + S9 写路径 + S8 Supervisor（全量零回归） |
 
 评测卫生：金标集与 few-shot 库严格错题；金标口径与 system prompt 一致（踩过 3 个评测设计坑）。
 

@@ -140,6 +140,7 @@
     <div class="switch" id="graphSwitch">
       <button data-g="agentic" class="on">Agent 自主编排</button>
       <button data-g="react">确定性管线</button>
+      <button data-g="supervisor">Supervisor 多智能体</button>
     </div>
     <button id="newThread">新对话</button>
   </header>
@@ -235,6 +236,7 @@ function init(){
       document.querySelectorAll("#graphSwitch button").forEach(x => x.classList.remove("on"));
       b.classList.add("on"); graphMode = b.dataset.g;
       if(graphMode === "agentic"){ ask.placeholder = "Agent 自主编排：模型自己决定调哪些工具、可自愈重试"; }
+      else if(graphMode === "supervisor"){ ask.placeholder = "Supervisor 多智能体：规划→分工(SQL/分析/图表)→判官质检，不合格打回重做"; }
       else { ask.placeholder = "确定性管线：理解→生成 SQL→校验→执行→解读，流程固定"; }
     });
   boot();

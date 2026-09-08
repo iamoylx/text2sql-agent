@@ -29,6 +29,7 @@ from src.safety.validator import (
     _is_real_token,
     _BLOCKED_SUBSTR,
     extract_table_names,
+    extract_cte_names,
 )
 
 # 写路径允许的语句类型（DDL/DCL 永远不允许 LLM 提案；建表走 CSV 导入的系统路径）
@@ -70,8 +71,9 @@ def validate_write(sql: str) -> WriteCheckResult:
         if bad in up:
             return WriteCheckResult(False, layer="dangerous", reason=f"禁止危险子句: {bad}")
 
-    # ② 表名白名单（INSERT INTO / UPDATE / DELETE FROM 的表位都被 AST 提取覆盖）
-    tables = extract_table_names(sql)
+    # ② 表名白名单（INSERT INTO / UPDATE / DELETE FROM 的表位都被 AST 提取覆盖；
+    #    CTE 别名同读路径逻辑排除——写语句极少带 WITH，但带上是对的）
+    tables = extract_table_names(sql) - extract_cte_names(sql)
     bad_t = {t for t in tables if t not in ALLOWED_TABLES}
     if bad_t:
         return WriteCheckResult(

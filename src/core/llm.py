@@ -25,7 +25,8 @@ def get_llm(*, streaming: bool = False) -> BaseChatModel:
             timeout=settings.llm_timeout,
             streaming=streaming,
         )
-    # 默认 agnes
+    # 默认 agnes。max_retries=1：SDK 内置指数退避在 429 时会拖 10-20 分钟
+    # （S8 双跑实测踩坑），重试职责上移给调用层（_llm_json 20s 退避 / 评测层 60s 退避）
     return ChatOpenAI(
         model=settings.agnes_model,
         api_key=settings.agnes_api_key,
@@ -34,4 +35,5 @@ def get_llm(*, streaming: bool = False) -> BaseChatModel:
         max_tokens=settings.llm_max_tokens,
         timeout=settings.llm_timeout,
         streaming=streaming,
+        max_retries=1,
     )

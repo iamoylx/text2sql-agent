@@ -83,3 +83,39 @@ def test_timeout_interrupts_slow_query():
 def test_normal_query_with_timeout_ok():
     ok, err, rows = execute_with_timeout(str(DB), "SELECT COUNT(*) AS c FROM orders")
     assert ok and rows[0]["c"] == 99441
+
+
+# ---------------- S8 补：CTE 别名不得被表名白名单误杀 ----------------
+
+class TestCteWhitelist:
+    SQL_CTE = (
+        'WITH max_month AS ('
+        '  SELECT strftime("%Y-%m", order_purchase_timestamp) AS m, COUNT(*) AS n'
+        '  FROM orders WHERE order_status=\'delivered\' GROUP BY m)'
+        ' SELECT m, n FROM max_month ORDER BY n DESC LIMIT 1'
+    )
+
+    def test_cte_alias_not_treated_as_table(self):
+        from src.safety.validator import validate_sql
+        r = validate_sql(self.SQL_CTE)
+        assert r.passed, f"CTE 别名被误杀: {r.reason}"
+
+    def test_cte_does_not_mask_real_violation(self):
+        from src.safety.validator import validate_sql
+        sql = ('WITH t AS (SELECT * FROM orders)'
+               ' SELECT * FROM t JOIN hackers ON 1=1')
+        r = validate_sql(sql)
+        assert not r.passed and 'hackers' in r.reason
+
+    def test_cte_names_extraction(self):
+        from src.safety.validator import extract_cte_names
+        assert extract_cte_names(self.SQL_CTE) == {"max_month"}
+        assert extract_cte_names("SELECT 1") == set()
+
+    def test_cte_in_writer_path(self):
+        # 写路径同样排除 CTE（理论上少用，但口径必须一致）
+        from src.safety.writer import validate_write
+        sql = ('WITH target AS (SELECT order_id FROM orders WHERE order_id=\'o1\')'
+               ' UPDATE orders SET status=\'x\' WHERE order_id IN (SELECT order_id FROM target)')
+        r = validate_write(sql)
+        assert r.passed, f"CTE 写法被误杀: {r.reason}"

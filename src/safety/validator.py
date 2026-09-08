@@ -133,6 +133,52 @@ def extract_table_names(sql: str) -> set[str]:
     return out
 
 
+def extract_cte_names(sql: str) -> set[str]:
+    """提取 WITH 定义的 CTE 别名（如 WITH t AS (...) SELECT * FROM t 里的 t）。
+
+    为什么必须排除：CTE 名出现在 FROM/JOIN 的「表位」上，表名提取会把它当真表
+    ——白名单校验就把合法 SQL 误杀了（S8 双跑评测 b3 实测踩中）。
+    CTE 是查询内的临时命名结果集，不是库里的表，不该接受表白名单管辖。
+    """
+    out: set[str] = set()
+    try:
+        for stmt in sqlparse.parse(sql):
+            _collect_cte(stmt, out)
+    except Exception:
+        pass
+    return out
+
+
+def _collect_cte(tok, out: set[str]) -> None:
+    """递归找 WITH 关键字，收集其后的 CTE 定义名（覆盖子查询里的嵌套 WITH）。"""
+    if tok is None or not getattr(tok, "is_group", False):
+        return
+    toks = list(tok.tokens)
+    for i, t in enumerate(toks):
+        if t.is_keyword and t.value.upper() == "WITH":
+            # WITH 后连续的 Identifier / IdentifierList 都是 CTE 定义，直到出现其他关键字
+            for nxt in toks[i + 1:]:
+                if nxt.is_whitespace:
+                    continue
+                if nxt.is_keyword:
+                    break
+                nm = ""
+                if isinstance(nxt, IdentifierList):
+                    for item in nxt.get_sublists():
+                        nm = (item.get_real_name() or "").strip().strip('"`[]').lower()
+                        if nm:
+                            out.add(nm)
+                    continue
+                if isinstance(nxt, Identifier):
+                    nm = (nxt.get_real_name() or "").strip().strip('"`[]').lower()
+                if nm:
+                    out.add(nm)
+                else:
+                    break
+        elif t.is_group:
+            _collect_cte(t, out)
+
+
 
 def validate_sql(sql: str) -> ValidationResult:
     """对 LLM 生成的 SQL 做四层安全校验（②表名白名单 + ③LIMIT 注入 + 语句类型白名单）。
@@ -165,8 +211,8 @@ def validate_sql(sql: str) -> ValidationResult:
         if bad in up:
             return ValidationResult(False, layer="stmt_type", reason=f"禁止危险子句: {bad}")
 
-    # ② 表名白名单
-    tables = extract_table_names(sql)
+    # ② 表名白名单（WITH 定义的 CTE 别名是查询内临时结果集，不是库表，先排除）
+    tables = extract_table_names(sql) - extract_cte_names(sql)
     bad = {t for t in tables if t not in ALLOWED_TABLES}
     if bad:
         return ValidationResult(

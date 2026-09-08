@@ -247,3 +247,34 @@ Function 节点，原表名提取只认 Identifier → **INSERT 的表白名单�
 
 设计立场：读路径 LLM 自主循环 + 四层安全兜底；写路径**永不进自主循环**——模型有建议权，
 人有否决权与执行权（执行凭据独立：SQLite 去 mode=ro / MySQL 形态为 agent_rw 账号）。
+
+
+## S8 Supervisor 多智能体 + LLM-as-Judge（2026-09-08/09）✅
+
+第三种编排：planner 拆解 → sql_agent / analysis_agent / viz_agent 子 Agent（**messages 各自隔离，
+产出汇入共享黑板**——黑板模式，子 Agent 的碎碎念互不可见）→ judge 质量门控 → respond。
+全部 add_node/add_conditional_edges 手写（禁 prebuilt，与 S3/S4 同约束）。
+
+**双跑对照（同 8 条行为用例，S3/S4 口径零漂移，evals/s8_dual_result.json）**：
+
+| 指标 | agentic（单 Agent） | supervisor（多智能体） |
+|---|---|---|
+| 行为正确率 | **8/8 = 1.000** | **7/8 = 0.875**（唯一失败 b5 是 AGNES 免费额度 429，非设计缺陷） |
+| LLM 调用数 | 29 | 32（规划+判官的额外开销） |
+| token | 78,579 | **34,888（-56%）**——黑板隔离让每个子 Agent 上下文极小 |
+| 端到端延迟 | 293.6s | 828.1s（串行分工 + 判官轮次，诚实展示代价） |
+
+质量门控两层：① Python 硬门控（黑板产出完整性）② LLM-as-Judge 软门控（数字溯源/口径合规/
+结论与数据一致性，严格 JSON 裁决 pass/fix + fix_target + 修改指令，revision≤2）。
+浏览器实测抓到真实打回循环：规划器给计数题省掉了 analysis → 判官硬门控「缺分析结论」打回 →
+分析师补产 → 判官 pass（verify_shots/P2_S8_Supervisor判官打回循环.png）。
+
+**双跑评测连带修出三个真 bug（面试素材）**：
+1. **CTE 别名被表名白名单误杀**（S3-S5 读路径一直存在的隐患）：`WITH max_month AS (...) SELECT
+   * FROM max_month` 的 max_month 出现在 FROM 表位，被当越权表。修复：extract_cte_names
+   从表名集合排除 WITH 定义（读写两路共用，4 个新单测）。
+2. **sql_agent 漏 Schema 注入**：只列表名不列字段，模型猜错列归属（b2 把 customers 的
+   customer_zip_code_prefix 写成 o. 前缀）。补全 Schema 注入后 b2 PASS——多智能体的子 Agent
+   上下文裁剪过头会直接掉准确率，「隔离 ≠ 裸奔」。
+3. **AGNES SDK 429 退避风暴**：ChatOpenAI 内置指数退避把单次限流拖成 20 分钟。max_retries=1
+   快速失败 + 调用层/评测层自管退避 + 评测断点续跑（s8_progress.jsonl 每例落盘）。

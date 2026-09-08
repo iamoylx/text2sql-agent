@@ -147,6 +147,9 @@ def _get_graph(graph_type: str):
         if graph_type == "react":
             from src.agent.react_graph import build_agent_graph
             _GRAPHS["react"] = build_agent_graph()
+        elif graph_type == "supervisor":
+            from src.agent.supervisor_graph import build_supervisor_graph
+            _GRAPHS["supervisor"] = build_supervisor_graph()
         else:
             from src.agent.agentic_graph import build_agentic_graph
             _GRAPHS["agentic"] = build_agentic_graph()
@@ -351,7 +354,33 @@ def _norm_react(node: str, upd: dict) -> list[dict]:
     return out
 
 
-_NORM = {"agentic": _norm_agentic, "react": _norm_react}
+def _norm_supervisor(node: str, upd: dict) -> list[dict]:
+    """supervisor 图（S8）：planner/子 Agent/judge 的更新 → 统一事件。
+    子 Agent 通过 emit_* 瞬态字段声明要往前端推的东西，归一化层转成事件。"""
+    out: list[dict] = []
+    if node == "planner" and upd.get("plan"):
+        names = " → ".join(p["agent"] for p in upd["plan"])
+        out.append(_ev("thought", step="planner",
+                       content=f"任务规划（Supervisor 分工）：{names}"))
+    if upd.get("emit_sql"):
+        out.append(_ev("sql", step="sql_agent", sql=upd["emit_sql"]))
+    if upd.get("emit_result") is not None:
+        out.append(_ev("result", step="sql_agent", **_rows_preview(upd["emit_result"])))
+    if upd.get("emit_chart"):
+        out.append(_ev("chart", step="viz_agent", config=upd["emit_chart"]))
+    if upd.get("emit_note"):
+        out.append(_ev("thought", step=node, content=upd["emit_note"]))
+    if node == "judge" and upd.get("judge_issues") and upd.get("verdict") == "fix":
+        out.append(_ev("thought", step="judge",
+                       content=f"问题清单：{upd['judge_issues']}"))
+    if "message" in upd:
+        out.append(_ev("answer", step="respond", message=_strip_chart_xml(upd["message"]),
+                       status=upd.get("status", "ok"),
+                       **_rows_preview(upd.get("result") or [])))
+    return out
+
+
+_NORM = {"agentic": _norm_agentic, "react": _norm_react, "supervisor": _norm_supervisor}
 
 
 # ---------------------------------------------------------------------------
