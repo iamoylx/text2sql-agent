@@ -308,7 +308,11 @@ function handleEvent(ev, card, rows, evSeq, setSqls, setChart, setHid){
     const bar = el("div","bar", (ev.content || "执行失败") + (ev.blocked ? "（安全拦截）" : ""));
     card.appendChild(bar);
   }else if(ev.type === "answer"){
-    card.appendChild(el("div","answerText", md(ev.message || "")));
+    // md() 产出的是 HTML，必须走 innerHTML——textContent 会把整段标签当正文显示（乱码根因）
+    // 安全性：md() 内部先整体 escape 再只插入白名单标签，无注入面
+    const ans = el("div", "answerText");
+    ans.innerHTML = md(ev.message || "");
+    card.appendChild(ans);
     card._status = ev.status;
     setStatus(ev.status);
   }
