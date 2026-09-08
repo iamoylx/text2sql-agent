@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass, field
 
 import sqlparse
-from sqlparse.sql import Identifier, IdentifierList, Parenthesis
+from sqlparse.sql import Function, Identifier, IdentifierList, Parenthesis
 from sqlparse.tokens import Comment, Keyword, Name
 
 
@@ -89,6 +89,12 @@ def _from_identifier(tok, out: set[str]) -> None:
             _scan_subqueries(tok, out)
             return
         # sqlparse 0.6.0: real_name 属性已移除，用 get_real_name()（去 alias 取真表名）
+        name = (tok.get_real_name() or "").strip().strip('"`[]')
+        if name:
+            out.add(name.lower())
+    elif isinstance(tok, Function):
+        # 表名后跟列名括号会被 sqlparse 分组成 Function（如 INSERT INTO t(col) VALUES…），
+        # 不接住它整个目标表就漏提取——写路径等于没有表白名单
         name = (tok.get_real_name() or "").strip().strip('"`[]')
         if name:
             out.add(name.lower())

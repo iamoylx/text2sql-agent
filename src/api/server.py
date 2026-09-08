@@ -74,9 +74,22 @@ def _svc_init() -> None:
                  history_id TEXT, rating INTEGER, comment TEXT,
                  created_at TEXT)"""
         )
+        # P2-S9 写提案表：HITL 的「提案→决策」全留痕
+        con.execute(
+            """CREATE TABLE IF NOT EXISTS proposals(
+                 id TEXT PRIMARY KEY, question TEXT, sql TEXT, stmt_type TEXT,
+                 tables TEXT, affected INTEGER, status TEXT,
+                 created_at TEXT, decided_at TEXT)"""
+        )
 
 
 _svc_init()
+
+# 恢复历史 CSV 导入表（表本体在 SQLite 里持久；注册信息进白名单/Schema 注入）
+from src.db.schema import load_custom_tables
+_N_CUSTOM = load_custom_tables()
+if _N_CUSTOM:
+    print(f"[schema] restored {_N_CUSTOM} custom table(s) from csv import")
 
 
 def _save_history(rid: str, question: str, events: list[dict],
@@ -118,6 +131,11 @@ class FeedbackRequest(BaseModel):
     comment: str = Field("", max_length=500)
 
 
+class ConfirmRequest(BaseModel):
+    proposal_id: str = Field(..., max_length=64)
+    action: str = Field("confirm", description="confirm | reject")
+
+
 # ---------------------------------------------------------------------------
 # 图缓存（懒构建：首次请求才 import 图模块，服务启动不烧 token）
 # ---------------------------------------------------------------------------
@@ -157,6 +175,77 @@ def _strip_chart_xml(s: str | None) -> str:
 
 def _ev(type_: str, **data: Any) -> dict:
     return {"type": type_, "ts": _utc(), **data}
+
+
+# ---------------------------------------------------------------------------
+# P2-S9 写路径（HITL 旁路）：写意图 → 提案 SQL → 事务 dry-run → 人审 → 执行
+# 设计立场：写永不进 LLM 自主循环——模型有建议权，人有否决权与执行权。
+# ---------------------------------------------------------------------------
+_WRITE_HINT_RE = re.compile(
+    r"(插入|新增|添加|写入|录入|更新|修改|改成|改为|删除|删掉|清空|抹掉|去掉)"
+)
+_WRITE_SYS_PROMPT = """你是数据分析库的写操作助手。用户提出了一个可能涉及数据变更（增/删/改）的请求。
+你的任务：判断意图并生成**提案 SQL**（SQLite 方言，当前库为 Olist 电商数据）。
+
+铁律：
+1. 若用户真实意图是查询/分析（哪怕提到"删除""修改"等词，如"被删除的订单有哪些"），输出 intent=read，不给 SQL。
+2. 写提案仅允许单条 INSERT / UPDATE / DELETE；UPDATE/DELETE 必须带 WHERE。
+3. 只能操作下述业务表；严禁 DDL（CREATE/DROP/ALTER）。
+4. 不确定主键/具体值时，先用保守的 WHERE（宁可 0 行也不可误伤），并在 warn 里说明。
+
+{schema}
+
+只输出 JSON（不要代码块）：
+{{"intent": "write" 或 "read", "sql": "INSERT/UPDATE/DELETE 语句或空串", "warn": "给审批人看的风险说明"}}"""
+
+
+def build_write_proposal(question: str) -> dict:
+    """写意图判定 + 提案生成 + dry-run 预估。产出 SSE proposal 事件的全部原料。"""
+    import json as _json
+    from src.db.schema import TABLES
+    from src.safety.writer import validate_write, dry_run_write
+
+    schema_block = "\n".join(
+        f"{t}: {m['comment']}（字段: {', '.join(m['columns'])}）" for t, m in TABLES.items())
+    sys_prompt = _WRITE_SYS_PROMPT.replace("{schema}", schema_block)
+
+    from src.core.llm import get_llm
+    llm = get_llm()
+    resp = llm.invoke([("system", sys_prompt), ("user", question)])
+    raw = (resp.content or "").strip()
+    if not raw:  # AGNES 偶发空 content——必须重试一次兜底
+        resp = llm.invoke([("system", sys_prompt), ("user", question)])
+        raw = (resp.content or "").strip()
+    m = re.search(r"\{.*\}", raw, re.S)
+    if not m:
+        return {"intent": "read"}   # 解析不出 JSON → 按读路径走
+    try:
+        plan = _json.loads(m.group(0))
+    except Exception:
+        return {"intent": "read"}
+
+    if plan.get("intent") != "write" or not plan.get("sql"):
+        return {"intent": "read"}
+
+    sql = str(plan["sql"]).strip().rstrip(";")
+    chk = validate_write(sql)
+    if not chk.passed:
+        # 模型给了写 SQL 但没过三道闸：不生成提案，转读路径并记录拦截原因
+        return {"intent": "read", "blocked_note": f"[写提案拦截·{chk.layer}] {chk.reason}"}
+
+    ok, err, affected, sample = dry_run_write(str(settings.db_path), sql)
+    if not ok:
+        return {"intent": "read", "blocked_note": f"[dry-run 失败] {err}"}
+
+    pid = uuid.uuid4().hex[:12]
+    with _svc_conn() as con:
+        con.execute("INSERT INTO proposals VALUES (?,?,?,?,?,?,?,?,?)",
+                    (pid, question, sql, chk.stmt_type, json.dumps(chk.tables),
+                     affected, "pending", _utc(), None))
+    return {"intent": "write", "proposal_id": pid, "sql": sql,
+            "stmt_type": chk.stmt_type, "tables": chk.tables,
+            "affected": affected, "sample": sample,
+            "warn": str(plan.get("warn", ""))[:300]}
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +373,30 @@ def _stream(req: QueryRequest) -> AsyncIterator[str]:
     def produce() -> None:
         events: list[dict] = []
         try:
+            # --- P2-S9: 写意图旁路（HITL）——正则命中才试，读请求零开销 ---
+            if _WRITE_HINT_RE.search(req.question):
+                prop = build_write_proposal(req.question)
+                if prop.get("intent") == "write":
+                    ev = _ev("thought", step="write_intent",
+                             content=f"识别到数据变更意图 → 生成写提案（不执行，等待人工审批）")
+                    events.append(ev)
+                    q.put(f"data: {json.dumps(ev, ensure_ascii=False)}\n\n")
+                    ev = _ev("proposal", step="hitl", **prop)
+                    events.append(ev)
+                    q.put(f"data: {json.dumps(ev, ensure_ascii=False)}\n\n")
+                    done = {"type": "done", "history_id": rid, "status": "proposal",
+                            "proposal_id": prop["proposal_id"]}
+                    q.put(f"data: {json.dumps(done, ensure_ascii=False)}\n\n")
+                    _save_history(rid, req.question, events,
+                                  f"写提案待审批：{prop['stmt_type']} 影响约 {prop['affected']} 行",
+                                  "proposal", req.graph)
+                    return
+                if prop.get("blocked_note"):
+                    ev = _ev("thought", step="write_intent",
+                             content=f"写意图被安全闸拦截，转读路径处理：{prop['blocked_note']}")
+                    events.append(ev)
+                    q.put(f"data: {json.dumps(ev, ensure_ascii=False)}\n\n")
+
             for chunk in graph.stream({"question": req.question},
                                        config=config,
                                        stream_mode="updates"):
@@ -359,6 +472,81 @@ def api_feedback(fb: FeedbackRequest):
             "INSERT INTO feedback(history_id, rating, comment, created_at) VALUES (?,?,?,?)",
             (fb.history_id, fb.rating, fb.comment, _utc()))
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# P2-S9: 写提案审批 + CSV 导入
+# ---------------------------------------------------------------------------
+from fastapi import UploadFile, File
+
+from src.safety.writer import validate_write, commit_write, audit_log
+
+
+def _get_proposal(pid: str) -> dict | None:
+    with _svc_conn() as con:
+        r = con.execute("SELECT * FROM proposals WHERE id=?", (pid,)).fetchone()
+    return dict(r) if r else None
+
+
+@app.post("/api/confirm")
+def api_confirm(req: ConfirmRequest):
+    """人审决策：confirm=用写凭据执行提案（事务+影响行数+审计）；reject=留痕拒绝。"""
+    prop = _get_proposal(req.proposal_id)
+    if prop is None:
+        raise HTTPException(404, "proposal not found")
+    if prop["status"] != "pending":
+        raise HTTPException(409, f"提案已处理过（{prop['status']}），拒绝重复执行")
+
+    if req.action == "reject":
+        with _svc_conn() as con:
+            con.execute("UPDATE proposals SET status='rejected', decided_at=? WHERE id=?",
+                        (_utc(), req.proposal_id))
+        audit_log(str(settings.db_path), {
+            "event": "reject", "proposal_id": req.proposal_id,
+            "sql": prop["sql"], "question": prop["question"]})
+        return {"ok": True, "status": "rejected", "affected": 0}
+
+    # confirm：重新过三道闸（防 proposal 落库后被人篡改/库里白名单已变的边界），再执行
+    chk = validate_write(prop["sql"])
+    if not chk.passed:
+        audit_log(str(settings.db_path), {
+            "event": "confirm_blocked", "proposal_id": req.proposal_id,
+            "sql": prop["sql"], "reason": f"{chk.layer}: {chk.reason}"})
+        raise HTTPException(422, f"提案 SQL 复检未过（{chk.layer}）：{chk.reason}")
+    ok, err, affected = commit_write(str(settings.db_path), prop["sql"])
+    status = "executed" if ok else "failed"
+    with _svc_conn() as con:
+        con.execute("UPDATE proposals SET status=?, decided_at=?, affected=? WHERE id=?",
+                    (status, _utc(), affected, req.proposal_id))
+    audit_log(str(settings.db_path), {
+        "event": status, "proposal_id": req.proposal_id, "sql": prop["sql"],
+        "affected": affected, "error": err})
+    if not ok:
+        raise HTTPException(500, f"执行失败：{err}")
+    return {"ok": True, "status": "executed", "affected": affected,
+            "sql": prop["sql"], "tables": json.loads(prop["tables"])}
+
+
+@app.post("/api/upload_csv")
+async def api_upload_csv(file: UploadFile = File(...)):
+    """CSV 上传入库（基础版）：核心逻辑在 src/db/csvimport.py（可独立测试）。
+
+    系统路径（非 LLM 路径）：DDL 受控生成；新表注册进白名单与 Schema 注入，
+    Agent 下一次提问即可查询。
+    """
+    from src.db.csvimport import import_csv_bytes
+
+    content = (await file.read()).decode("utf-8-sig", errors="replace")
+    r = import_csv_bytes(file.filename or "", content, str(settings.db_path))
+    if r.error:
+        raise HTTPException(400, f"CSV 入库失败：{r.error}")
+    audit_log(str(settings.db_path), {
+        "event": "csv_import", "table": r.table,
+        "rows_file": r.rows_in_file, "rows_inserted": r.rows_inserted})
+    return {"ok": True, "table": r.table, "columns": r.columns, "types": r.types,
+            "quality": {"rows_in_file": r.rows_in_file,
+                        "rows_inserted": r.rows_inserted,
+                        "match": r.quality_ok}}
 
 
 @app.get("/api/health")

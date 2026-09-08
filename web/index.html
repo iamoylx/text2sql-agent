@@ -96,6 +96,27 @@
   #chart{width:100%;height:100%}
   .emptyHint{color:var(--ink3);font-size:12px;padding:26px;text-align:center}
   .bar{color:var(--err);font-size:12px;padding:8px 12px;border:1px solid rgba(212,69,69,.3);background:rgba(212,69,69,.06);border-radius:10px;margin:6px 2px}
+  /* P2-S9 写提案审批卡 */
+  .propBox{margin:8px 0;border:1px solid rgba(166,124,0,.4);background:rgba(166,124,0,.05);border-radius:12px;padding:10px 12px}
+  .propHead{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+  .propBadge{font-size:10px;font-weight:700;letter-spacing:1px;padding:2px 10px;border-radius:999px;background:var(--ink);color:#fff}
+  .propBadge.update{background:#a67c00}.propBadge.delete{background:#d44545}.propBadge.insert{background:#0a9e6c}
+  .propTitle{font-size:12px;color:var(--ink)}
+  .propMeta{font-size:11.5px;color:var(--dim);line-height:1.8;margin:6px 0}
+  .propWarn{color:#a67c00}
+  .propBox pre.sql{display:block;background:rgba(255,255,255,.6)}
+  .propSample{font-size:11px;color:var(--dim);margin:4px 0}
+  .propSample summary{cursor:pointer}
+  .propSampleRows div{padding:2px 0;border-bottom:1px dashed var(--line);font-family:var(--mono)}
+  .propBtns{display:flex;gap:8px;margin-top:8px}
+  .propBtns button{padding:6px 16px;border-radius:8px;border:none;cursor:pointer;font-size:12.5px;font-weight:600}
+  .propOk{background:var(--ink);color:#fff}
+  .propNo{background:transparent;border:1px solid var(--line)!important;color:var(--ink)}
+  .propBtns button:disabled{opacity:.45;cursor:not-allowed}
+  .propResult{font-size:12px;margin-top:8px;padding:6px 10px;border-radius:8px}
+  .propResult.okk2{color:var(--ok);border:1px solid rgba(10,158,108,.3)}
+  .propResult.no2{color:var(--err);border:1px solid rgba(212,69,69,.3)}
+  #csvResult{padding:0 10px}
   /* 输入区 */
   #inputBar{padding:10px 16px 14px;border-top:1px solid var(--line)}
   #askRow{display:flex;gap:8px;align-items:center;background:var(--card-solid);border:1px solid var(--line2);border-radius:12px;padding:6px 6px 6px 14px}
@@ -125,7 +146,12 @@
 
   <main>
     <section id="leftPane" class="pane glass">
-      <h2>数据库 Schema · Olist 电商（9 表）</h2>
+      <h2 style="display:flex;justify-content:space-between;align-items:center;padding-right:10px">
+        <span>数据库 Schema · Olist 电商</span>
+        <button id="csvBtn" style="font-size:11px;padding:3px 10px;cursor:pointer;border-radius:8px;border:1px solid rgba(127,127,127,.35);background:transparent;color:inherit">＋ 导入CSV</button>
+      </h2>
+      <input type="file" id="csvFile" accept=".csv" hidden>
+      <div id="csvResult"></div>
       <div id="schema"><div class="emptyHint">加载中…</div></div>
     </section>
 
@@ -164,8 +190,8 @@ const EXAMPLES = [
   "2018 年订单量最高的前 5 个州是哪些？用图表展示",
   "平均客单价最高的前 3 个州是哪些？",
   "2025 年有多少笔订单？（空结果兜底）",
-  "把 orders 表删掉（安全演示）",
-  "2017 年各品类销量 Top5，用图表展示"
+  "新增客户：customer_id=c_test_001，customer_unique_id=u_test_001，城市=sao paulo，州=SP（写提案演示）",
+  "被取消的订单有多少笔？（对照：提到“取消”但其实是查询）"
 ];
 
 function init(){
@@ -178,6 +204,27 @@ function init(){
     if(e.key === "Enter" && !e.shiftKey){ e.preventDefault(); doSend(); }
   });
   $("#sendBtn").onclick = doSend;
+  // P2-S9: CSV 导入（系统路径入库 → 动态注册进白名单/Schema → 立即可问）
+  $("#csvBtn").onclick = () => $("#csvFile").click();
+  $("#csvFile").onchange = async () => {
+    const f = $("#csvFile").files[0];
+    if(!f) return;
+    const box = $("#csvResult");
+    box.innerHTML = '<div class="emptyHint">导入中：' + escapeHtml(f.name) + ' …</div>';
+    try{
+      const fd = new FormData(); fd.append("file", f);
+      const r = await fetch("/api/upload_csv", {method: "POST", body: fd});
+      const d = await r.json();
+      if(!r.ok) throw new Error(d.detail || r.status);
+      box.innerHTML = '<div class="emptyHint">✓ ' + escapeHtml(d.table) + ' · ' +
+        d.quality.rows_inserted + '/' + d.quality.rows_in_file + ' 行入库' +
+        (d.quality.match ? '' : '（行数不一致！）') + ' · 可直接提问查询</div>';
+      loadSchema();   // 新表已进 /api/schema
+    }catch(e){
+      box.innerHTML = '<div class="emptyHint">导入失败：' + escapeHtml(e.message) + '</div>';
+    }
+    $("#csvFile").value = "";
+  };
   $("#newThread").onclick = () => {
     threadId = "t_" + Date.now().toString(36);
     chat.innerHTML = "";
@@ -307,6 +354,11 @@ function handleEvent(ev, card, rows, evSeq, setSqls, setChart, setHid){
     stepsEl.appendChild(el("span","chip err", "失败"));
     const bar = el("div","bar", (ev.content || "执行失败") + (ev.blocked ? "（安全拦截）" : ""));
     card.appendChild(bar);
+  }else if(ev.type === "proposal"){
+    // P2-S9 HITL：写提案卡——模型只有建议权，执行必须人点确认
+    stepsEl.appendChild(el("span","chip warn","写提案 · 待审批"));
+    card.appendChild(renderProposal(ev));
+    setStatus("proposal");
   }else if(ev.type === "answer"){
     // md() 产出的是 HTML，必须走 innerHTML——textContent 会把整段标签当正文显示（乱码根因）
     // 安全性：md() 内部先整体 escape 再只插入白名单标签，无注入面
@@ -383,8 +435,66 @@ function renderTable(rowsArr, total){
   box.insertBefore(el("div","emptyHint", rowsArr.length > 200 ? "共 " + total + " 行，显示前 200 行" : "共 " + total + " 行"), box.firstChild);
 }
 
-function renderChart(cfg){
-  if(!chart) chart = echarts.init($("#chart"));
+// 写提案审批卡：SQL + 事务 dry-run 影响行数 + 取证样本 + 风险说明；确认/拒绝都留审计
+function renderProposal(ev){
+  const box = el("div","propBox");
+  const head = el("div","propHead");
+  head.append(
+    el("span","propBadge " + (ev.stmt_type || "").toLowerCase(), ev.stmt_type || "WRITE"),
+    el("span","propTitle", "写操作提案（未执行，等待你的确认）"));
+  box.appendChild(head);
+
+  const pre = el("pre","sql open", ev.sql || "");
+  box.appendChild(pre);
+
+  const meta = el("div","propMeta");
+  const aff = el("span", null, "预估影响 " + ev.affected + " 行（事务 dry-run 实测，非估算）");
+  const tb  = el("span", null, "目标表：" + (ev.tables || []).join(", "));
+  meta.append(aff, document.createElement("br"), tb);
+  if(ev.warn) meta.append(document.createElement("br"), el("span","propWarn","⚠ " + ev.warn));
+  box.appendChild(meta);
+
+  if((ev.sample || []).length){
+    const det = el("details","propSample");
+    det.appendChild(el("summary", null, "将被改动的行（预览 " + ev.sample.length + " 行）"));
+    const srows = el("div","propSampleRows");
+    ev.sample.forEach(r => {
+      srows.appendChild(el("div", null, Object.entries(r).slice(0, 6)
+        .map(([k, v]) => k + "=" + String(v).slice(0, 24)).join(" · ")));
+    });
+    det.appendChild(srows);
+    box.appendChild(det);
+  }
+
+  const btns = el("div","propBtns");
+  const ok = document.createElement("button"); ok.className = "propOk"; ok.textContent = "✓ 确认执行";
+  const no = document.createElement("button"); no.className = "propNo"; no.textContent = "✕ 拒绝";
+  const decide = async action => {
+    ok.disabled = no.disabled = true;
+    try{
+      const r = await fetch("/api/confirm", {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({proposal_id: ev.proposal_id, action})});
+      const d = await r.json();
+      if(!r.ok) throw new Error(d.detail || r.status);
+      btns.remove();
+      box.appendChild(el("div", "propResult " + (action === "confirm" ? "okk2" : "no2"),
+        action === "confirm"
+          ? "已执行 · 实际影响 " + d.affected + " 行（审计已记录）"
+          : "已拒绝（审计已记录）"));
+    }catch(e){
+      btns.remove();
+      box.appendChild(el("div","propResult no2","决策失败：" + e.message));
+    }
+  };
+  ok.onclick = () => decide("confirm");
+  no.onclick = () => decide("reject");
+  btns.append(ok, no);
+  box.appendChild(btns);
+  return box;
+}
+
+function renderChart(cfg){  if(!chart) chart = echarts.init($("#chart"));
   chart.setOption(Object.assign({grid:{left:48,right:24,top:36,bottom:40},
     color:["#3d5afe","#0a9e6c"], textStyle:{color:"#5b6270",fontSize:11}}, cfg || {}), true);
 }

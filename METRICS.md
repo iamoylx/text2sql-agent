@@ -224,3 +224,26 @@ pytest 40 passed 无回归。
    拦截路径）——安全层硬拦截应交给 validator 单测（17 攻击用例），端到端只验「无写操作落地」。
 4. 点名不存在表时模型倾向语义映射（users→customers）——understand 提示词加
    「不在 Schema 的表不得擅自映射，需说明不存在」规则后正确拒绝。
+
+
+## S9 写路径与数据接入（P2 主项目拓展，2026-09-08）✅
+
+简历「库的增删改查」落地，核心是 **HITL 提案-人审**（Human-In-The-Loop）：
+
+| 能力 | 实现 | 实测 |
+|---|---|---|
+| 写意图识别 | 正则粗筛（读请求零开销）→ LLM 单次调用出严格 JSON（intent/sql/warn），intent=read 原路返回 | 「被取消的订单有多少」正确判读；「新增客户 c_test_001」正确出提案 |
+| 写提案三道闸 | `src/safety/writer.py`：①仅单条 INSERT/UPDATE/DELETE ②表名白名单（AST）③UPDATE/DELETE 必带 WHERE（AST） | pytest 8 攻击用例全过；字符串藏 WHERE/拼接 DROP 均拦 |
+| **事务 dry-run** | BEGIN→写→SELECT changes()→ROLLBACK：**零副作用拿精确影响行数** + WHERE 取证样本行 | affected=1 精确；dry-run 后数据逐字节原样；提前抓住 NOT NULL 违约的 INSERT |
+| 人审执行 | SSE 推 `proposal` 事件 → 前端审批卡（SQL/影响行数/样本/风险）→ 确认/拒绝 → `/api/confirm` 复检+事务执行 | 浏览器全链路：提案→确认→「已执行·实际影响 1 行」→ DELETE 提案删净 |
+| 审计日志 | `data/db/write_audit.jsonl` 每次决策留痕（ts/sql/affected/谁批的） | executed/rejected 全记录 |
+| CSV 导入 | `src/db/csvimport.py`：表名/列名清洗 + 类型推断 + 批量插入 + 行数质检 + **动态注册进白名单与 Schema 注入**（`custom_tables.json` 重启恢复） | 4 行 CSV→建表插入→Agent **立即查到新表**（SQL/结果/解读全对） |
+
+**测试与回归**：`tests/test_writer.py` 18 用例（三道闸 8 + dry-run 3 + commit/审计 2 + CSV 5），全量 pytest **58 passed + 1 skipped 零回归**。
+
+**连带修出的安全 bug（面试素材）**：sqlparse 把 `INSERT INTO t(col) VALUES…` 的目标表分组成
+Function 节点，原表名提取只认 Identifier → **INSERT 的表白名单等于不存在**。补 Function
+分支后读写两路共用同一修复。次要修复：UPDATE/DELETE 的 WHERE 判断需 flatten（Where 是分组节点）。
+
+设计立场：读路径 LLM 自主循环 + 四层安全兜底；写路径**永不进自主循环**——模型有建议权，
+人有否决权与执行权（执行凭据独立：SQLite 去 mode=ro / MySQL 形态为 agent_rw 账号）。

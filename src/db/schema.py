@@ -218,3 +218,60 @@ def render_schema_md(row_counts: dict[str, int] | None = None) -> str:
         lines.append("")
     lines += ["## 外键关系", ""] + [f"- {r}" for r in RELATIONS]
     return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# 动态表注册（P2-S9 CSV 导入）：新表进白名单 + 进 Schema 注入，Agent 可查
+# ---------------------------------------------------------------------------
+
+
+def _settings_db_path() -> str:
+    from src.core.config import settings
+    return str(settings.db_path)
+
+def register_dynamic_table(name: str, comment: str, ddl: str, columns: dict[str, str]) -> None:
+    """把 CSV 导入产生的表注册进 TABLES 与白名单（原地 mutate，保证所有
+    `from ... import ALLOWED_TABLES` 的既有引用同步可见——重绑定会让别名拿到旧对象）。"""
+    if name in TABLES:
+        return
+    TABLES[name] = {"comment": comment, "ddl": ddl, "columns": columns}
+    # validator.ALLOWED_TABLES 与本模块共享同一 set 对象（模块顶层 set(TABLES.keys())
+    # 是当时的浅拷贝，动态表必须显式补进去）
+    from src.safety import validator
+    validator.ALLOWED_TABLES.add(name)
+
+
+def load_custom_tables() -> int:
+    """服务启动时恢复历史导入的 CSV 表（注册信息落盘 data/db/custom_tables.json）。"""
+    import json
+    from pathlib import Path
+    from src.core.config import settings
+    reg = Path(_settings_db_path()).parent / "custom_tables.json"
+    if not reg.exists():
+        return 0
+    try:
+        metas = json.loads(reg.read_text(encoding="utf-8"))
+    except Exception:
+        return 0
+    for m in metas:
+        register_dynamic_table(m["name"], m["comment"], m["ddl"], m["columns"])
+    return len(metas)
+
+
+def save_custom_table_meta(name: str, comment: str, ddl: str, columns: dict[str, str],
+                           db_path: str = "") -> None:
+    """注册信息落盘（重启后 load_custom_tables 恢复；表本体已在 SQLite 里持久）。
+    db_path 显式传参：注册文件跟随目标库所在目录，测试用临时库时不写穿真实库。"""
+    import json
+    from pathlib import Path
+    reg = (Path(db_path).parent if db_path
+           else Path(_settings_db_path())) / "custom_tables.json"
+    metas = []
+    if reg.exists():
+        try:
+            metas = json.loads(reg.read_text(encoding="utf-8"))
+        except Exception:
+            metas = []
+    metas = [m for m in metas if m["name"] != name]
+    metas.append({"name": name, "comment": comment, "ddl": ddl, "columns": columns})
+    reg.write_text(json.dumps(metas, ensure_ascii=False, indent=1), encoding="utf-8")
