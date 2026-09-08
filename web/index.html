@@ -76,6 +76,10 @@
   .answerText table.ansTbl tr:nth-child(even) td{background:rgba(30,35,50,.015)}
   .answerText ul.ansUl{margin:6px 0 6px 18px;padding:0}
   .answerText ul.ansUl li{list-style:disc;margin:2px 0;line-height:1.55;white-space:pre-wrap}
+  .answerText ol.ansOl{margin:6px 0 6px 18px;padding:0}
+  .answerText ol.ansOl li{list-style:decimal;margin:2px 0;line-height:1.55;white-space:pre-wrap}
+  .answerText h3.ansH{font-size:15px;font-weight:700;margin:10px 0 6px;padding-bottom:3px;border-bottom:1px solid var(--line)}
+  .answerText p.ansP{margin:6px 0;line-height:1.6}
   .fb{display:flex;gap:6px;margin-top:8px;align-items:center}
   .fb button{border:1px solid var(--line2);background:transparent;width:28px;height:26px;border-radius:8px;cursor:pointer;font-size:13px;color:var(--ink2);line-height:1}
   .fb button:hover{border-color:var(--accent);color:var(--accent)}
@@ -393,7 +397,7 @@ function escapeHtml(s){
 }
 function md(s){
   s = String(s||"");
-  // 1. 把 markdown 表格整段提到占位符（单元格内单独 escape，不会被后面冲掉）
+  // 1. markdown 表格 → 占位符（单元格先 escape，防被第 3 步全局 escape 二次破坏）
   const tables = [];
   s = s.replace(/((?:\|[^\n]*\n)+)/g, function(block){
     const lines = block.trim().split("\n");
@@ -410,17 +414,42 @@ function md(s){
   });
   // 2. 剔除可能漏到文本里的 ECharts XML（图表已由 render_chart 工具独立产出）
   s = s.replace(/<\s*echarts(?:-config)?[^>]*>[\s\S]*?<\/\s*echarts(?:-config)?\s*>/gi, "");
-  // 3. 全局 escape
+  // 3. 全局 escape（此后才允许插入我们自己的标签）
   s = escapeHtml(s);
-  // 4. 行内排版
-  s = s.replace(/\*\*(.+?)\*\*/g,"<b>$1</b>")
-       .replace(/`([^`]+)`/g,"<code>$1</code>")
-       .replace(/(^|\n)[ \t]*[-*] (.+)/g, '$1<li>$2</li>');
-  // 5. 把连续的 <li> 包成 <ul>
-  s = s.replace(/(?:<li>[^<]+<\/li>\n?)+/g, function(m){ return "<ul class=\"ansUl\">" + m + "</ul>"; });
-  // 6. 还原表格占位符
-  s = s.replace(/\u0001T(\d+)\u0001/g, function(_,i){ return tables[parseInt(i)]; });
-  return s;
+  // 4. 行内排版：加粗 / 行内代码（基于已 escape 文本，只作用单行内容）
+  const inline = function(t){
+    return t.replace(/\*\*(.+?)\*\*/g,"<b>$1</b>")
+            .replace(/`([^`]+)`/g,"<code>$1</code>");
+  };
+  // 5. 逐行转块级元素：## 标题 / 无序列表 / 有序列表 / 表格占位 / 段落。
+  //    列表必须成组包 <ul>/<ol>——旧版用正则包 <li> 遇到含 <b> 的内容就失败（<li> 裸奔）
+  const out = [];
+  let listTag = null, listBuf = null;
+  const flushList = function(){
+    if (listBuf){
+      out.push("<" + listTag + ' class="ans' + (listTag === "ul" ? "Ul" : "Ol") + '">'
+               + listBuf.join("") + "</" + listTag + ">");
+      listBuf = null; listTag = null;
+    }
+  };
+  s.split("\n").forEach(function(raw){
+    const line = raw.replace(/\s+$/,"");
+    const mh = line.match(/^(#{1,6})\s+(.*)$/);          // ## 标题（统一渲染成 h3，避免层级过大）
+    if (mh){ flushList(); out.push('<h3 class="ansH">' + inline(mh[2]) + "</h3>"); return; }
+    const mt = line.match(/^\u0001T(\d+)\u0001$/);       // 表格占位符还原
+    if (mt){ flushList(); out.push(tables[parseInt(mt[1])]); return; }
+    const mu = line.match(/^[ \t]*[-*]\s+(.*)$/);        // 无序列表项
+    if (mu){ if (listTag !== "ul"){ flushList(); listTag = "ul"; listBuf = []; }
+             listBuf.push("<li>" + inline(mu[1]) + "</li>"); return; }
+    const mo = line.match(/^\s*\d{1,3}[.、)]\s+(.*)$/);  // 有序列表项
+    if (mo){ if (listTag !== "ol"){ flushList(); listTag = "ol"; listBuf = []; }
+             listBuf.push("<li>" + inline(mo[1]) + "</li>"); return; }
+    flushList();
+    if (!line.trim()) return;                            // 空行留白由块级元素 margin 承担
+    out.push('<p class="ansP">' + inline(line) + "</p>");
+  });
+  flushList();
+  return out.join("");
 }
 init();
 </script>
