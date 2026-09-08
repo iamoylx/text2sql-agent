@@ -25,6 +25,7 @@ P2-S6 服务化：FastAPI + SSE 流式问答服务。
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 import uuid
@@ -138,6 +139,22 @@ def _utc() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
+# 防御：模型偶尔在 answer 文本里塞 <echarts-config>{...}</echarts-config>（图表已由
+# render_chart 工具独立产出），同时兼容被前端 HTML 转义后的 &lt;…&gt; 形式
+_CHART_XML_RE = re.compile(
+    r"<\s*echarts(?:-config)?[^>]*>.*?</\s*echarts(?:-config)?\s*>", re.S | re.I)
+_CHART_XML_ESC_RE = re.compile(
+    r"&lt;\s*echarts(?:-config)?[^&]*&gt;.*?&lt;/\s*echarts(?:-config)?\s*&gt;", re.S | re.I)
+
+
+def _strip_chart_xml(s: str | None) -> str:
+    if not s:
+        return s or ""
+    s = _CHART_XML_RE.sub("", s)
+    s = _CHART_XML_ESC_RE.sub("", s)
+    return s.strip()
+
+
 def _ev(type_: str, **data: Any) -> dict:
     return {"type": type_, "ts": _utc(), **data}
 
@@ -206,7 +223,7 @@ def _norm_agentic(node: str, upd: dict) -> list[dict]:
             elif tool == "generate_sql":
                 pass  # SQL 已在 agent 的 tool_call 阶段推送，避免重复
     if "message" in upd:
-        out.append(_ev("answer", step="respond", message=upd["message"],
+        out.append(_ev("answer", step="respond", message=_strip_chart_xml(upd["message"]),
                        status=upd.get("status", "ok"),
                        **_rows_preview(upd.get("result") or [])))
     return out
@@ -239,7 +256,7 @@ def _norm_react(node: str, upd: dict) -> list[dict]:
         if upd.get("sql"):
             out.append(_ev("sql", step=f"self_correct(第{upd.get('retry_count', 0)}次)", sql=upd["sql"]))
     elif node == "respond":
-        out.append(_ev("answer", step="respond", message=upd.get("message", ""),
+        out.append(_ev("answer", step="respond", message=_strip_chart_xml(upd.get("message", "")),
                        status=upd.get("status", "ok"),
                        **_rows_preview(upd.get("result") or [])))
     return out
@@ -257,8 +274,10 @@ def _stream(req: QueryRequest) -> AsyncIterator[str]:
     import threading
 
     graph, _cp = _get_graph(req.graph)
-    config = {"configurable": {"thread_id": req.thread_id or "default"}}
     rid = uuid.uuid4().hex[:12]
+    # 每次请求独立 thread_id：图带 MemorySaver checkpoint，固定 "default" 会让
+    # 上一轮未收敛的现场（messages/steps）串到下一次查询 → 秒回"已达步数上限"
+    config = {"configurable": {"thread_id": req.thread_id or rid}}
     norm = _NORM[req.graph]
     q: "queue.Queue[str | None]" = queue.Queue(maxsize=128)
 

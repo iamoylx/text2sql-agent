@@ -74,7 +74,9 @@ TOOL_SCHEMAS: list[dict] = [
                     "metric": {"type": "string",
                                "enum": ["sum", "avg", "count", "max", "min", "mom", "yoy", "ratio"],
                                "description": "指标类型"},
-                    "data_ref": {"type": "string", "description": "结果集引用名"},
+                    "data_ref": {"type": "string",
+                                 "description": "结果集引用名：execute_readonly_sql 成功后的结果"
+                                                "固定存于 result，直接填 \"result\""},
                     "value_col": {"type": "string", "description": "数值列名"},
                     "group_by": {"type": "array", "items": {"type": "string"},
                                  "description": "分组列名（可空）"},
@@ -94,7 +96,9 @@ TOOL_SCHEMAS: list[dict] = [
                     "chart_type": {"type": "string", "enum": ["bar", "line", "pie"]},
                     "x": {"type": "string", "description": "X 轴字段名"},
                     "y": {"type": "string", "description": "Y 轴字段名"},
-                    "data_ref": {"type": "string", "description": "结果集引用名"},
+                    "data_ref": {"type": "string",
+                                 "description": "结果集引用名：execute_readonly_sql 成功后的结果"
+                                                "固定存于 result，直接填 \"result\""},
                 },
                 "required": ["chart_type", "x", "y", "data_ref"],
             },
@@ -131,9 +135,18 @@ def _tool_execute_sql(p: dict) -> dict:
     return {"ok": True, "rows": rows, "row_count": len(rows)}
 
 
+def _resolve_rows(registry: dict[str, Any], data_ref: str) -> list:
+    """data_ref 容错解析：模型偶尔把引用名编成别名（如 top5_categories_2017），
+    而注册表实际只有 result 一个键 → 取不到且非 result 时，唯一结果集下兜底用 result。"""
+    rows = registry.get(data_ref) or []
+    if not rows and data_ref != "result" and registry.get("result"):
+        rows = registry["result"]
+    return rows
+
+
 def _tool_compute_metric(p: dict, results_registry: dict[str, Any]) -> dict:
     metric, value_col, group_by = p["metric"], p["value_col"], p.get("group_by") or []
-    rows = results_registry.get(p["data_ref"]) or []
+    rows = _resolve_rows(results_registry, p["data_ref"])
     if not rows:
         return {"ok": False, "error": f"结果集 {p['data_ref']} 为空或不存在"}
     # 简易实现：单值聚合（分组聚合的通用实现放 S5 评测后再扩）
@@ -161,7 +174,7 @@ def _tool_compute_metric(p: dict, results_registry: dict[str, Any]) -> dict:
 
 
 def _tool_render_chart(p: dict, results_registry: dict[str, Any]) -> dict:
-    rows = results_registry.get(p["data_ref"]) or []
+    rows = _resolve_rows(results_registry, p["data_ref"])
     if not rows:
         return {"ok": False, "error": f"结果集 {p['data_ref']} 为空或不存在"}
     x_vals = [str(r.get(p["x"], "")) for r in rows]

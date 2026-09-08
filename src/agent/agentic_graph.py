@@ -78,6 +78,9 @@ _AGENTIC_SYSTEM_PROMPT = f"""你是电商数据分析 Agent。数据库是 Olist
 
 ## 收尾
 用中文给用户一段简洁结论：先说核心数字，再补关键发现。给出结论后不要再调用工具。
+图表由 render_chart 工具独立生成（前端右栏渲染），**不要在回答文本中再粘贴
+ECharts 配置或写 <echarts-config>{...}</echarts-config> 等 XML 标签**——重复且
+会被前端剔除，浪费 token。回答里只写人类可读的文字与 markdown 表格。
 """
 
 
@@ -125,6 +128,7 @@ def tools(state: dict) -> dict:
     registry: dict = {"result": state.get("result") or []}
     out_msgs: list = []
     new_result = None
+    seen: set[tuple[str, str]] = set()   # 去重：AGNES 偶发同一轮重复发同参数 tool_call
     for call in calls:
         name = call.get("name") or ""
         raw_args = call.get("args") or {}
@@ -134,6 +138,12 @@ def tools(state: dict) -> dict:
             except Exception:
                 raw_args = {}
         tool_id = call.get("id") or call.get("tool_call_id") or ""
+        key = (name, json.dumps(raw_args, ensure_ascii=False, sort_keys=True))
+        if key in seen:
+            # 重复调用：跳过执行（同参数结果一致），也不回 ToolMessage——
+            # 避免模型把"失败"误读为重试，白烧步数
+            continue
+        seen.add(key)
         result = dispatch(name, raw_args, registry)
         # execute 成功 → 结果集写入注册表 + 状态（供 compute_metric/render_chart 与 respond 使用）
         if name == "execute_readonly_sql" and result.get("ok"):
