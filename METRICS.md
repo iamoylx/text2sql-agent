@@ -278,3 +278,26 @@ Function 节点，原表名提取只认 Identifier → **INSERT 的表白名单�
    上下文裁剪过头会直接掉准确率，「隔离 ≠ 裸奔」。
 3. **AGNES SDK 429 退避风暴**：ChatOpenAI 内置指数退避把单次限流拖成 20 分钟。max_retries=1
    快速失败 + 调用层/评测层自管退避 + 评测断点续跑（s8_progress.jsonl 每例落盘）。
+
+
+## S7 MCP Server + Client（2026-09-09）✅
+
+把核心能力按 **MCP 协议**对外开放，同时验证「第三方工具即插即用」反向接入：
+
+| 能力 | 实现 | 实测 |
+|---|---|---|
+| MCP Server | `src/mcp_server.py`（FastMCP）：暴露 4 个工具（generate_sql / execute_readonly_sql / compute_metric / render_chart），**复用 src/tools/registry 同一实现**——不是另写一份绕过安全的副本 | 双传输实测：stdio 子进程回环 + `--http 8600` streamable-http（curl 握手 + 客户端调用成功） |
+| MCP Client | `src/mcp_client.py` `MCPToolBridge`：后台事件循环线程 + `run_coroutine_threadsafe` 同步桥；`AsyncExitStack` 持有全部上下文管理器 | `enable_mcp_tools(server_specs)` 一行接入：发现 → 转换 → `register_external_tool` 动态注册，Agent 下一轮 bind_tools 即可见 |
+| 安全不旁路 | 经 MCP 调 `DROP TABLE orders` / 查白名单外表 → 照样被四层安全拦截 | `[安全拦截·stmt_type] 仅允许 SELECT 查询` / 越权表拦截，协议外壳不改变安全语义 |
+| 第三方接入 | `examples/mcp_demo_server.py`（8610 端口，模拟外部工具提供方） | `now_utc` 工具即插即用：发现 → JSON Schema→Pydantic 动态建模 → dispatch 返回 `2026-09-09T02:39:04Z` |
+| 动态注册防撞 | 与原生同名工具被跳过（原生优先，不覆盖）；新名工具经 Pydantic 校验通道 dispatch（缺必填参数返回校验错误，无旁路） | 9 个 MCP 单测（tests/test_mcp.py）全过 |
+
+**踩坑（面试素材）**：
+1. **`__aenter__()` 后未持有上下文管理器对象 → GC 断连**：stdio_client 的连接被垃圾回收后
+   报 `Connection closed`。修复：AsyncExitStack 统一持有（进栈即保活）。
+2. **非 JSON 文本响应被误判为失败**：工具返回纯文本时按协议 isError 标志判定，
+   非 JSON 包装成 `{"ok": true, "text": ...}`，不把正常文本当异常。
+3. **评测卫生的延续**：`test_mcp_generate_sql_returns_sql` 是全测试套件唯一依赖真实 LLM 的
+   用例，AGNES 免费额度 429 时 pytest.skip（非代码缺陷）——与 S8 评测的限流口径一致。
+
+全量回归：**pytest 76 passed + 1 skipped 零回归**。

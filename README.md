@@ -39,7 +39,8 @@ S8 双跑对照：行为 7/8（唯一失败是免费额度限流）、**token -5
 | 写路径安全用例 | 18/18 | S9 HITL：三道闸 8 + dry-run 零副作用 3 + commit/审计 2 + CSV 导入 5 |
 | Supervisor 离线用例 | 5/5 | S8：FakeLLM 驱动全图（happy path / 判官打回循环 / 安全降级 / 规划纠偏） |
 | CTE 白名单用例 | 4/4 | S8 连带修复：WITH 别名不被误杀、不掩盖真越权表 |
-| 服务层测试 | pytest 67 passed | 工具双保险 + 安全层 + S9 写路径 + S8 Supervisor（全量零回归） |
+| MCP 协议用例 | 9/9 | S7：stdio/http 双传输回环 + 安全不旁路 + 第三方工具动态注册 |
+| 服务层测试 | pytest 76 passed | 工具双保险 + 安全层 + S9 写路径 + S8 Supervisor + S7 MCP（全量零回归） |
 
 评测卫生：金标集与 few-shot 库严格错题；金标口径与 system prompt 一致（踩过 3 个评测设计坑）。
 
@@ -53,6 +54,24 @@ S8 双跑对照：行为 7/8（唯一失败是免费额度限流）、**token -5
 4. `/api/confirm` 复检三道闸 → **独立写凭据**（SQLite 去 mode=ro；MySQL 形态 agent_rw 账号）事务执行 → `write_audit.jsonl` 审计留痕
 
 数据接入：左栏「＋ 导入CSV」→ 表名/列名清洗 + 类型推断 + 行数质检 → **动态注册进白名单与 Schema 注入**（重启自动恢复），Agent 下一句即可查询新表。
+
+## MCP 对外开放 + 第三方工具接入（S7）
+
+能力开放遵循一条原则：**MCP 只是协议外壳，安全语义不变**——
+
+- **Server**（`src/mcp_server.py`，FastMCP）：把 generate_sql / execute_readonly_sql /
+  compute_metric / render_chart 四个工具按 MCP 暴露，实现层复用 `src/tools/registry`
+  同一份代码（不是绕过安全的副本）。支持 stdio 与 streamable-http 双传输：
+  `python src/mcp_server.py --http 8600`
+- **Client**（`src/mcp_client.py`）：后台事件循环 + AsyncExitStack 保活连接；
+  任何 MCP server 一行接入：
+  ```python
+  from src.mcp_client import enable_mcp_tools
+  enable_mcp_tools([{"name": "ext", "transport": "http", "url": "http://127.0.0.1:8610/mcp"}])
+  # 发现 → inputSchema 动态转 Pydantic → register_external_tool → Agent 下一轮可见
+  ```
+- 经 MCP 调 `DROP TABLE` / 查白名单外表**照样被四层安全拦截**；
+  与原生同名的第三方工具被跳过（原生优先），新工具经 Pydantic 校验通道 dispatch（无旁路）。
 
 ## 架构
 
@@ -112,8 +131,9 @@ python -m pytest -q                  # 单测
 | 8 | `src/agent/prompting.py` + `fewshot.py` | Schema 注入 / few-shot 加权检索（bigram TF，CPU 可部署取舍） |
 | 9 | `src/api/server.py` | FastAPI + SSE 真流式（producer thread + queue）；事件归一化；输出净化 |
 | 10 | `web/index.html` | 原生 JS 三栏布局；SSE 消费；markdown 逐行渲染；ECharts |
-| 11 | `evals/run_eval_s5.py` | 评测框架：金标比对 / 断点续跑 / 结果归因 |
-| 12 | `METRICS.md` | 全部指标数字与踩坑记录（面试素材库） |
+| 11 | `src/mcp_server.py` + `src/mcp_client.py` | **MCP 双向**：FastMCP 工具开放（复用 registry）+ AsyncExitStack 客户端 + 动态注册 |
+| 12 | `evals/run_eval_s5.py` | 评测框架：金标比对 / 断点续跑 / 结果归因 |
+| 13 | `METRICS.md` | 全部指标数字与踩坑记录（面试素材库） |
 
 ## 已知边界与生产化路线（诚实清单）
 

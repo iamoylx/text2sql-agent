@@ -87,3 +87,35 @@ PARAM_MODELS = {
     "compute_metric": ComputeMetricParams,
     "render_chart": RenderChartParams,
 }
+
+
+# ---------------------------------------------------------------------------
+# JSON Schema → Pydantic 动态建模（P2-S7 MCP 外部工具注册用）
+# ---------------------------------------------------------------------------
+
+_JSON_TYPES = {"string": str, "number": float, "integer": int,
+               "boolean": bool, "array": list, "object": dict}
+
+
+def json_schema_to_pydantic(name: str, schema: dict) -> type:
+    """把 MCP tool 的 inputSchema 转成 Pydantic 模型。
+
+    为什么必须过这一层：外部 MCP 工具注册进 agent 后，走的是与原生四工具同一条
+    dispatch 通道——参数先过 Pydantic 再转发，**外部工具不旁路校验**（面试口径：
+    工具可以外挂，安全语义不外挂）。
+    """
+    from typing import Any
+
+    from pydantic import create_model
+
+    props = schema.get("properties") or {}
+    required = set(schema.get("required") or [])
+    fields: dict[str, tuple] = {}
+    for fname, spec in props.items():
+        py_t = _JSON_TYPES.get((spec or {}).get("type"), Any)
+        if fname in required:
+            fields[fname] = (py_t, ...)
+        else:
+            default = (spec or {}).get("default")
+            fields[fname] = (py_t | None, default) if default is None else (py_t, default)
+    return create_model(f"{name}_args", **fields)

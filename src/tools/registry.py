@@ -25,7 +25,7 @@ from src.agent.prompting import build_system_prompt, render_fewshots_block, rend
 from src.core.config import settings
 from src.core.llm import get_llm
 from src.safety.validator import execute_with_timeout, validate_sql as run_validate
-from src.tools.models import PARAM_MODELS
+from src.tools.models import PARAM_MODELS, json_schema_to_pydantic
 
 # ---------------- JSON Schema（给 LLM 看） ----------------
 
@@ -214,6 +214,7 @@ def dispatch(
 ) -> dict:
     """统一入口：Pydantic 校验（第二道保险）→ 工具实现 → 统一 dict 结果。
     校验失败返回 {ok: False, error: '参数校验失败: ...'}，由 tools 节点转 ToolMessage。
+    MCP 外部工具（S7）注册后走同一条校验通道，只是实现转发到远端会话。
     """
     results_registry = results_registry or {}
     model_cls = PARAM_MODELS.get(name)
@@ -225,6 +226,8 @@ def dispatch(
         first = e.errors()[0]
         return {"ok": False, "error": f"参数校验失败: {first.get('loc')} {first.get('msg')}"}
     pd = p.model_dump()
+    if name in _EXTERNAL_DISPATCH:
+        return _EXTERNAL_DISPATCH[name](pd)   # MCP 外部工具：校验后转发远端会话
     if name == "generate_sql":
         return _tool_generate_sql(pd)
     if name == "execute_readonly_sql":
@@ -234,3 +237,24 @@ def dispatch(
     if name == "render_chart":
         return _tool_render_chart(pd, results_registry)
     return {"ok": False, "error": f"未实现工具: {name}"}
+
+
+# ---------------- MCP 外部工具注册通道（P2-S7） ----------------
+# 原生四工具优先：同名 MCP 工具不注册（两者实现/安全层完全一致，注册了也是重复）；
+# 非冲突的外部工具动态进 TOOL_SCHEMAS 与 PARAM_MODELS，agent 下一轮 bind_tools 即可看见。
+
+_EXTERNAL_DISPATCH: dict[str, Any] = {}
+
+
+def register_external_tool(openai_schema: dict, input_schema: dict,
+                           dispatcher: Any) -> str | None:
+    """注册一个 MCP 发现的外部工具。返回工具名；与原生四工具同名则跳过返回 None。"""
+    name = openai_schema["function"]["name"]
+    if name in PARAM_MODELS:          # 原生工具优先，拒绝覆盖
+        return None
+    if any(t["function"]["name"] == name for t in TOOL_SCHEMAS):
+        return None
+    TOOL_SCHEMAS.append(openai_schema)
+    PARAM_MODELS[name] = json_schema_to_pydantic(name, input_schema)
+    _EXTERNAL_DISPATCH[name] = dispatcher
+    return name
