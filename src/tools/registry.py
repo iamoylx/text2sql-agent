@@ -189,7 +189,12 @@ def _tool_render_chart(p: dict, results_registry: dict[str, Any]) -> dict:
 
 
 def _build_context(question: str):
-    """Schema 注入 + Few-shot 检索（复用 prompting 层）。"""
+    """Schema 注入 + Few-shot 检索（复用 prompting 层）。
+
+    ⚠️ 已知重复：与 src/agent/nodes.py 的 _build_context 几乎逐行相同（S3 先有、
+    S4 做工具化时复制）——差别仅在取行数/采样的连接方式（这里走 SQLAlchemy 之外
+    的 sqlite3 ro 直连，语义一致）。抽公共层列为改进项；改动任一处必须同步检查另一处。
+    """
     import sqlite3
     con = sqlite3.connect(f"file:{settings.db_path}?mode=ro", uri=True)
     try:

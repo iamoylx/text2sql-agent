@@ -121,6 +121,9 @@ python -m pytest -q                  # 单测
 
 ## 代码导读（推荐阅读顺序）
 
+> 详细版（每文件的内容/作用/模块关系/阅读要点 + 整体 pipeline 图 + 术语表）见
+> **[ARCHITECTURE.md](ARCHITECTURE.md)**；下表是速览版。
+
 | 顺序 | 文件 | 知识点 |
 |---|---|---|
 | 1 | `src/core/config.py` | pydantic-settings；SQLite/MySQL URL 抽象（库无关设计） |

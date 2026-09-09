@@ -1,23 +1,27 @@
 """
 P2-S6 服务化：FastAPI + SSE 流式问答服务。
 
-接口（对应简历原文）：
-  POST /api/query    问一句业务问题 → SSE 流（thought/sql/result/chart/answer/error）
-  GET  /api/schema   返回 9 表 Schema（表注释 + 字段中文注释，供左栏渲染）
+接口全景：
+  POST /api/query       问一句业务问题 → SSE 流（thought/sql/result/chart/answer/error/proposal/done）
+  GET  /api/schema      返回 9 表 Schema（表注释 + 字段中文注释，供左栏渲染）
   GET  /api/history/{id}   查询历史会话（含事件轨迹）
-  POST /api/feedback 对一次问答打标（好评/差评 + 备注，沉淀评测样本）
+  POST /api/feedback    对一次问答打标（好评/差评 + 备注，沉淀评测样本）
+  POST /api/confirm     S9 写提案人审（confirm=写凭据执行 / reject=留痕拒绝）
+  POST /api/upload_csv  S9 CSV 导入（系统路径建表 + 动态注册）
+  GET  /api/health      存活探针
 
 事件协议（data: {json}\n\n 每行一个事件）：
-  thought —— ReAct 思考过程（understand 口径 / 工具调用意图 / 校验结果）
-  sql     —— 生成的 SQL（前端可展开 + 复制）
-  result  —— 结果集（前 30 行预览 + 总数，供右栏表格/图表）
-  chart   —— ECharts 配置（S4 render_chart 工具产出，前端直接 setOption）
-  answer  —— 最终结论（LLM 解读文本）
-  error   —— 失败/安全拦截
+  thought  —— ReAct 思考过程（understand 口径 / 工具调用意图 / 校验结果 / 判官裁决）
+  sql      —— 生成的 SQL（前端可展开 + 复制）
+  result   —— 结果集（前 30 行预览 + 总数，供右栏表格/图表）
+  chart    —— ECharts 配置（render_chart 工具产出，前端直接 setOption）
+  answer   —— 最终结论（LLM 解读文本）
+  proposal —— S9 写提案审批卡（SQL/影响行数/取证样本/风险说明）
+  error    —— 失败/安全拦截
 
 设计要点：
-  - 双图可选（?graph=agentic|react，默认 agentic 自主工具循环）——与 S3/S4 双编排
-    对照叙事一致；同一 SSE 归一化层把不同图的节点更新映射成统一事件。
+  - 三图可选（?graph=agentic|react|supervisor，默认 agentic 自主工具循环）——与 S3/S4/S8
+    三编排对照叙事一致；同一 SSE 归一化层（_norm_*）把不同图的节点更新映射成统一事件。
   - thread_id 隔离多轮会话（checkpointer MemorySaver 按 thread 存 messages，
     实现「那 2018 年呢」式追问）。
   - 历史落盘 data/db/service.db（sqlite，纯本地，不入 git）。
@@ -466,7 +470,7 @@ def _stream(req: QueryRequest) -> AsyncIterator[str]:
 @app.post("/api/query")
 async def api_query(req: QueryRequest):
     if req.graph not in _NORM:
-        raise HTTPException(400, "graph 必须是 agentic 或 react")
+        raise HTTPException(400, "graph 必须是 agentic / react / supervisor 之一")
     return StreamingResponse(_stream(req), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
                                       "X-Accel-Buffering": "no"})

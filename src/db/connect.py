@@ -45,7 +45,11 @@ def get_conn(*, readonly: bool = True) -> Connection:
 
 
 def execute_select(sql: str, *, limit: int | None = 1000) -> list[dict]:
-    """只读执行一条 SELECT，返回 list[dict]（列名 -> 值）。"""
+    """只读执行一条 SELECT，返回 list[dict]（列名 -> 值）。
+
+    注意：limit 截断发生在取回全部行之后（内存峰值取决于 SQL 本身）——
+    真正防大结果集的是 validator 第③层在 SQL 里注入 LIMIT，本参数只是保险丝。
+    """
     conn = get_conn(readonly=True)
     try:
         rows = conn.execute(text(sql)).mappings().all()

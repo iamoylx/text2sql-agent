@@ -30,6 +30,8 @@ class SQLAgentState(TypedDict, total=False):
     chart_config: dict | None                   # ECharts 配置（S6 用）
     token_cost: int                             # 累计 token
     steps: int                                  # agentic 图：已完成 agent 轮数（步数上限防死循环）
+    # ⚠️ 下面三行的 "= 默认值" 仅是文档性书写：TypedDict 运行时不生效（不会自动补默认），
+    # 实际读取必须统一 state.get(key, 默认) —— 节点代码里正是这么写的。
     status: Literal["ok", "blocked", "degraded"] = "ok"
     message: str = ""                           # 给用户的最终回复
     reject_reason: str = ""                     # 安全拦截原因（留证）

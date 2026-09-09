@@ -48,7 +48,7 @@ def _stmt_real_count(parsed) -> int:
 
 from src.db.schema import TABLES
 
-# 白名单：9 张业务表
+# 白名单：9 张 Olist 业务表（+ S9 CSV 导入动态注册的 csv_* 表——见 db.schema.register_dynamic_table）
 ALLOWED_TABLES: set[str] = set(TABLES.keys())
 
 # 语句类型黑名单关键字（get_type 之外的 DDL/DML/DCL，一律拒绝）

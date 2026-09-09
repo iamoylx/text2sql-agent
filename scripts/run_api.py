@@ -1,8 +1,8 @@
 """P2-S6 API 启动入口（FastAPI + SSE，端口 8501）。
 
 运行：python scripts/run_api.py
-注意：LLM Key（AGNES_API_KEY）从环境变量读取——用你自己的终端跑会自动继承；
-     在沙箱里跑需先从注册表 User scope 取值注入（见项目记忆）。
+注意：LLM Key（AGNES_API_KEY / DEEPSEEK_API_KEY）从环境变量或项目根 .env 读取，
+     缺失时服务能启动，但发起问答会报 OpenAIError: Missing credentials。
 """
 from __future__ import annotations
 

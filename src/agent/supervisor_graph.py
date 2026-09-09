@@ -30,7 +30,6 @@ Supervisor 多智能体总图（P2-S8 核心，手写 StateGraph，禁用 prebui
 from __future__ import annotations
 
 import json
-import operator
 import re
 from typing import Annotated, Literal, TypedDict
 
@@ -416,9 +415,6 @@ def judge(state: dict) -> dict:
 
 
 # ---------------- 条件边 ----------------
-
-_AGENT_BY_NAME = {}   # 构建时填充：agent 名 → 节点函数名（plan 顺序推进）
-
 
 def route_next_step(state: dict) -> str:
     """子 Agent 执行完 → plan 里有下一步就推进，否则进 judge。"""

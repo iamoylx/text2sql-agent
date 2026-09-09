@@ -19,7 +19,7 @@ _BLOCKED = ("INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE", "CREATE",
 
 _SQL_MAX_LEN = 4000      # SQL 长度上限（防超长拼接）
 _Q_MAX_LEN = 500         # 问题长度上限
-_CHART_TYPES = ("bar", "line", "pie", "scatter")
+_CHART_TYPES = ("bar", "line", "pie")   # 与 RenderChartParams 的 Literal 保持一致（scatter 走不通 dispatch）
 _METRICS = ("sum", "avg", "count", "max", "min", "mom", "yoy", "ratio")
 
 

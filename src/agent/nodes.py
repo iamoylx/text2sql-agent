@@ -42,7 +42,12 @@ _KNOWN_MAX_YEAR = 2018
 
 
 def _num_tokens(text: str) -> int:
-    """粗略 token 估算：中文 1 字 ≈ 1 token，英文按 4 字符 1 token。"""
+    """粗略 token 估算：直接按字符数计（usage 缺失时的兜底）。
+
+    有意「宁可高估」：中文 1 字 ≈ 1 token 基本准确，英文按字符数会高估 2-4 倍——
+    对 TOKEN_BUDGET 护栏来说高估是安全方向（提前收手好过烧穿额度）。
+    真实 token 以响应 usage_metadata 为准，本函数只在网关不回 usage 时兜底。
+    """
     return len(text)
 
 
@@ -240,9 +245,8 @@ def respond(state: dict) -> dict:
             "result": [],
         }
     # 生成结果解读（LLM 总结，避免直接把大表格甩给用户）
-    import json as _json
     sample = rows[:20]
-    preview = _json.dumps(sample[:5], ensure_ascii=False, default=str)
+    preview = json.dumps(sample[:5], ensure_ascii=False, default=str)
     sys_p = (
         "你是电商数据分析助手。用户问了一个问题，下面是 SQL 查询结果（最多展示前20行，"
         "预览为前5行）。用中文给出一段简洁的结论解读：先说结论数字，再补充关键发现。\n"

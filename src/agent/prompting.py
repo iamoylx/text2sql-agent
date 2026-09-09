@@ -47,8 +47,9 @@ def render_schema_block(
     samples: dict[str, list[tuple]] | None = None,
     row_counts: dict[str, int] | None = None,
 ) -> str:
-    """渲染 Schema 注入块。tables=None 表示全量注入（9 表 DDL 仅 ~5KB，S2 不剪枝；
-    剪枝是 P2-S3 select_tables 节点的事，模拟大库场景）。"""
+    """渲染 Schema 注入块。tables=None 表示全量注入（9 表 DDL 仅 ~5KB，实测全量注入
+    就是准确率最优解，无需剪枝——大库场景的表选择已由 understand/generate 的
+    few-shot 检索隐式引导，本函数保留 tables 参数即为将来接入大库预留的剪枝口）。"""
     names = list(tables) if tables else list(TABLES)
     blocks: list[str] = []
     for name in names:
