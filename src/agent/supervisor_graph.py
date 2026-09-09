@@ -40,12 +40,14 @@ from langgraph.graph import END, StateGraph
 from src.agent.nodes import _account_usage
 from src.core.config import settings
 from src.core.llm import get_llm
+from src.scenarios import get_profile
 from src.safety.validator import execute_with_timeout, validate_sql
 from src.tools.registry import dispatch
 
 MAX_REVISION = 2          # Judge 打回重做上限（防 judge-死循环烧 token）
 MAX_NODE_STEPS = 16       # 全图 LLM 调用次数上限（planner+子agent+judge 合计）
-_KNOWN_MAX_YEAR = 2018    # 与 S3/S4 口径一致
+_PROFILE = get_profile()
+_KNOWN_MAX_YEAR = _PROFILE.known_max_year    # 与 S3/S4 同源：场景包统一提供
 
 # 三类子 Agent 的职责边界（prompt 里的角色卡，互相隔离）
 _ROLE_CARDS = {
@@ -172,7 +174,7 @@ _PLANNER_PROMPT = """你是数据分析任务规划器。把用户的业务问�
 def planner(state: dict) -> dict:
     llm = get_llm()
     out, tok = _llm_json(llm, _PLANNER_PROMPT,
-                         f"用户问题：{state['question']}\n（数据范围约 2016-09 ~ 2018-10）")
+                         f"用户问题：{state['question']}\n（数据范围约 {_PROFILE.data_range}）")
     plan = (out or {}).get("plan") or []
     # 兜底规整：python 侧强约束（不信任 LLM 的规划）
     plan = [p for p in plan if p.get("agent") in _ROLE_CARDS]
@@ -212,26 +214,25 @@ def _schema_block() -> str:
     return _SCHEMA_BLOCK_CACHE
 
 
-_SQL_AGENT_PROMPT = """你是电商数据仓库的 SQL 工程师。数据库是 SQLite 方言的 Olist 巴西电商，
-数据范围约 2016-09 ~ 2018-10。把数据需求写成**单条 SELECT**。
+_SQL_AGENT_PROMPT = f"""你是{_PROFILE.domain}数据仓库的 SQL 工程师。数据库是 {_PROFILE.dialect} 方言的 {_PROFILE.db_desc}，
+数据范围约 {_PROFILE.data_range}。把数据需求写成**单条 SELECT**。
 
 ## 库 Schema（字段归属以此为准，严禁臆造列）
-{schema}
+{{schema}}
 
 ## 库里只有这 9 张表（严禁使用任何其他表名，如 olist_orders_dataset 等 Kaggle 原始文件名）
-customers / orders / order_items / order_payments / order_reviews /
-products / sellers / geolocation / product_category_translation
+{_PROFILE.table_catalog.replace('/', ' / ')}
 （可用 WITH ... AS 定义 CTE 临时结果集，最终主查询访问的实体表必须出自上表。）
 
 口径规则：
 1. 金额一律 BRL，「销售额/收入」默认含运费（price + freight_value）。
-2. 订单状态默认 delivered，除非需求明确要求其他状态。
-3. 相对时间（最近/今年）用 %s 年兜底；需求给了明确年份就用那年（哪怕查到空）。
-4. 客户去重/复购用 customer_unique_id。
-5. 需求中的表若不在上述 9 张内，输出 {"error": "无此表：<表名>"}。
+2. 订单状态默认 {_PROFILE.default_status}，除非需求明确要求其他状态。
+3. 相对时间（最近/今年）用 {_PROFILE.known_max_year} 年兜底；需求给了明确年份就用那年（哪怕查到空）。
+4. 客户去重/复购用 {_PROFILE.dedup_key}。
+5. 需求中的表若不在上述 9 张内，输出 {{"error": "无此表：<表名>"}}。
 
-只输出 JSON：{"sql": "SELECT ..."} 或 {"error": "..."}
-""" % _KNOWN_MAX_YEAR
+只输出 JSON：{{"sql": "SELECT ..."}} 或 {{"error": "..."}}
+"""
 
 
 def sql_agent(state: dict) -> dict:
@@ -254,9 +255,7 @@ def sql_agent(state: dict) -> dict:
         # 安全闸拦截 → 打回自愈一次（错误回喂），再拦就如实降级
         retry, tok2 = _llm_json(llm, sys_prompt,
                                 f"{user_prompt}\n\n【上一版被安全层拦截：{vr.reason}，"
-                                f"只能使用这 9 张表：customers/orders/order_items/order_payments/"
-                                f"order_reviews/products/sellers/geolocation/"
-                                f"product_category_translation，请修正】")
+                                f"只能使用这 9 张表：{_PROFILE.table_catalog}，请修正】")
         tok += tok2
         sql2 = str((retry or {}).get("sql") or "").strip().rstrip(";")
         vr2 = validate_sql(sql2)
@@ -301,7 +300,7 @@ def analysis_agent(state: dict) -> dict:
     rows_brief = json.dumps(rows[:20], ensure_ascii=False, default=str)
 
     sys_prompt = f"""{_ROLE_CARDS['analysis_agent']}
-数据范围约 2016-09 ~ 2018-10。铁律：
+数据范围约 {_PROFILE.data_range}。铁律：
 1. 结论里的每个数字必须能在结果行里找到（或明确标注为行数合计）；禁止心算出结果集中不存在的数。
 2. 结果为空就必须写明「没有匹配的记录」，并解释可能的口径/时间范围原因（如 2030 年超出数据范围、
    点名的表不存在等）。
@@ -352,12 +351,12 @@ def viz_agent(state: dict) -> dict:
 
 # ---------------- 节点 5：judge（LLM-as-Judge 质量门控） ----------------
 
-_JUDGE_PROMPT = """你是数据质量判官。审查一次数据分析的产出是否合格，只依据给定材料，不臆测。
+_JUDGE_PROMPT = f"""你是数据质量判官。审查一次数据分析的产出是否合格，只依据给定材料，不臆测。
 
 审查清单：
 1. 数字溯源：分析结论里的每个关键数字，能否在结果行 JSON 中找到对应值？（找不到 = fix）
-2. 口径合规：默认 delivered 状态、年份是否正确使用（2016-09 ~ 2018-10 之外要有说明）、
-   客户去重是否用 customer_unique_id。
+2. 口径合规：默认 {_PROFILE.default_status} 状态、年份是否正确使用（{_PROFILE.data_range} 之外要有说明）、
+   客户去重是否用 {_PROFILE.dedup_key}。
 3. 结论与数据一致：结果为空时结论是否如实说明？有数据时是否给出了结论？
 4. 图表（若产出）：x/y 列名是否存在于结果行的列中。
 
@@ -366,8 +365,8 @@ _JUDGE_PROMPT = """你是数据质量判官。审查一次数据分析的产出�
 - 数字编造 / 口径错误 / 结论与数据矛盾 → fix，并给出 fix_target（sql_agent=数据查错了 /
   analysis_agent=结论写错了 / viz_agent=图错了）与一句可执行的修改指令。
 
-只输出 JSON：{"verdict": "pass|fix", "fix_target": "analysis_agent",
-"issues": "问题清单（pass 时写 none）", "instruction": "给重做者的修改指令"}"""
+只输出 JSON：{{"verdict": "pass|fix", "fix_target": "analysis_agent",
+"issues": "问题清单（pass 时写 none）", "instruction": "给重做者的修改指令"}}"""
 
 
 def judge(state: dict) -> dict:

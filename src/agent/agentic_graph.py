@@ -36,20 +36,22 @@ from src.agent.nodes import _account_usage  # 复用 token 记账（跨节点单
 from src.agent.state import SQLAgentState
 from src.core.config import settings
 from src.core.llm import get_llm
+from src.scenarios import get_profile
 from src.tools.registry import TOOL_SCHEMAS, dispatch
 
 # 防死循环双上限（与 S3 react_graph 同源同值）
 MAX_STEPS = 8
 TOKEN_BUDGET = 40000
 
-# 数据最新完整年（相对时间兜底口径，与 S3 nodes._KNOWN_MAX_YEAR 保持一致）
-_KNOWN_MAX_YEAR = 2018
+_PROFILE = get_profile()
+# 数据最新完整年（相对时间兜底口径，与 S3 同源：由场景包统一提供）
+_KNOWN_MAX_YEAR = _PROFILE.known_max_year
 
 # 工具结果回写时截断：结果集很大时只给模型看前 N 行，避免把上下文打爆
 _OBSERVE_MAX_ROWS = 30
 
-_AGENTIC_SYSTEM_PROMPT = f"""你是电商数据分析 Agent。数据库是 Olist 巴西电商（9 张业务表），
-只能通过工具查询，禁止臆造数字。当前数据范围约 2016-09 ~ 2018-10。
+_AGENTIC_SYSTEM_PROMPT = f"""你是{_PROFILE.domain}数据分析 Agent。数据库是 {_PROFILE.db_desc}（{_PROFILE.table_catalog.replace('/', ' / ')}），
+只能通过工具查询，禁止臆造数字。当前数据范围约 {_PROFILE.data_range}。
 
 ## 可用工具与调用范式
 1. generate_sql —— 把「业务问题」转成 SQL。⚠️ 必须先调用它拿到 SQL，再把 SQL 交给 execute 执行
@@ -67,12 +69,11 @@ _AGENTIC_SYSTEM_PROMPT = f"""你是电商数据分析 Agent。数据库是 Olist
 
 ## 业务口径规则
 1. 金额一律 BRL，不换算；「销售额/收入」默认含运费（price + freight_value）。
-2. 订单状态默认 delivered（已送达），除非问题明确要求其他状态。
-3. 相对时间且无明确年份（如「最近/今年/N个月」）用 {_KNOWN_MAX_YEAR} 年兜底并显式说明；
+2. 订单状态默认 {_PROFILE.default_status}（已送达），除非问题明确要求其他状态。
+3. 相对时间且无明确年份（如「最近/今年/N个月」）用 {_PROFILE.known_max_year} 年兜底并显式说明；
    用户给了明确年份则保留原年份（如 2030 就查 2030，查到空结果如实汇报）。
-4. 客户维度去重/复购用 customer_unique_id（不是 customer_id）。
-5. 用户点名要查的表若不在 9 张业务表内（customers/orders/order_items/order_payments/
-   order_reviews/products/sellers/geolocation/product_category_translation），
+4. 客户维度去重/复购用 {_PROFILE.dedup_key}（不是 customer_id）。
+5. 用户点名要查的表若不在 {_PROFILE.table_catalog.replace('/', ' / ')} 内，
    如实说明「数据库无此表」并列出现有表名即可，**立即收尾、不得再查询/展示任何近似表
    （如 users→customers），不得编造**——近似映射会误导用户以为是同一张表。
 
@@ -81,7 +82,7 @@ _AGENTIC_SYSTEM_PROMPT = f"""你是电商数据分析 Agent。数据库是 Olist
 占比/百分比/差值等二次指标**禁止心算**，必须先用 compute_metric（ratio/sum/avg 等）
 算出真实值再写进回答——模型心算占比经常差一两个百分点。
 图表由 render_chart 工具独立生成（前端右栏渲染），**不要在回答文本中再粘贴
-ECharts 配置或写 <echarts-config>{...}</echarts-config> 等 XML 标签**——重复且
+ECharts 配置或写 <echarts-config>{{...}}</echarts-config> 等 XML 标签**——重复且
 会被前端剔除，浪费 token。回答里只写人类可读的文字与 markdown 表格。
 """
 

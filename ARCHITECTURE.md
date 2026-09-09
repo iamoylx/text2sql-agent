@@ -117,6 +117,29 @@ CSV 导入是另一条「系统路径」：DDL 由 `db/csvimport.py` 受控生�
   → `register_external_tool` 注册 → agent 下一轮 bind_tools 即可见。
   与原生同名的工具被跳过（原生优先），外部工具同样不旁路校验。
 
+## 5.5 场景包（业务外壳可插拔，复用性收口）
+
+架构原则「图是通用引擎，业务是外壳」的最终落点。业务以 `ScenarioProfile` 数据类注入：
+
+```
+src/scenarios/
+├── base.py    ScenarioProfile 数据契约（frozen dataclass，纯数据不持引擎引用）
+│              字段：domain/dialect/known_max_year/data_range/table_catalog/
+│              default_status/dedup_key/currency/db_desc
+└── olist.py   OLIST 实例（当前唯一内置场景，全引擎默认值）
+```
+
+**消费点**：nodes（understand 口径规范）/ agentic_graph（系统提示词）/
+supervisor_graph（planner·sql_agent·judge 三处）/ prompting（build_system_prompt 口径规则）/
+server（写提案提示词）。prompt 模板从 profile 取值渲染，换场景不改引擎。
+
+**换业务场景四步**：① 写新 `ScenarioProfile`（口径/年份/表目录）② 换 `db/schema.py` 的
+TABLES（DDL+中文注释，进白名单与 Schema 注入）③ 换金标与 few-shot（口径必须与新 profile
+一致——S5 评测卫生的教训）④ 引擎与图零改动。
+
+设计约束：profile 只收「多 prompt 共用且随业务变化」的值，单处措辞留在 prompt 里——
+过度抽象与硬绑定业务是同一种错误。
+
 ## 6. 代码阅读顺序指南
 
 > 原则：**先配置后逻辑、先数据后安全、先 S3 后 S4/S8**——每一层都只依赖已读过的层。
@@ -268,5 +291,6 @@ CSV 导入是另一条「系统路径」：DDL 由 `db/csvimport.py` 受控生�
 | LLM-as-Judge | 双层质量门控：Python 硬门控（完整性）+ LLM 软门控（溯源/口径），fix 打回 revision≤2 | supervisor_graph.judge |
 | 错误回喂自愈 | 执行失败把错误写回 messages/重新 prompt，模型据此修正（ReAct Observe→Reason） | nodes.self_correct / supervisor sql_agent |
 | 读写凭据分离 | 读走 mode=ro 连接，写走无 ro 的独立连接（MySQL 形态=agent_ro/agent_rw 双账号） | connect.get_conn / writer._rw_conn |
-| 口径规则 | 默认 delivered / BRL 不换算 / customer_unique_id 去重 / 相对时间 2018 兜底 | prompting.build_system_prompt + 各 system prompt |
+| 口径规则 | 默认 delivered / BRL 不换算 / customer_unique_id 去重 / 相对时间 2018 兜底 | scenarios/olist.py（全引擎取值） |
+| 场景包 | 业务以 ScenarioProfile 数据类注入，图/安全/工具零改动可换场景 | src/scenarios/ + 各 prompt 消费点 |
 | 事件归一化 | 三种图的节点更新 → 统一 6 类 SSE 事件协议 | server._norm_* |

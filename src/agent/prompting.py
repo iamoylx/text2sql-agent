@@ -88,21 +88,30 @@ def build_system_prompt(
     *,
     schema_block: str,
     fewshots_block: str,
-    dialect_note: str = "SQLite",
+    dialect_note: str | None = None,
+    profile: "ScenarioProfile | None" = None,
 ) -> str:
-    """组装 System Prompt。fewshots_block 为空时自动省略该段（消融对照组）。"""
+    """组装 System Prompt。fewshots_block 为空时自动省略该段（消融对照组）。
+
+    业务口径（币种/默认状态/去重键）从场景包取值——换场景换 profile，
+    规则措辞与数值不变。缺省用 Olist（当前唯一内置场景）。
+    """
+    from src.scenarios import get_profile
+
+    p = profile or get_profile()
+    dialect = dialect_note or p.dialect
     few = f"\n\n{fewshots_block}" if fewshots_block else ""
     return (
-        "你是电商业务数据分析助手。用户用自然语言提问，你需要把问题转成一条 SQL。\n"
-        f"数据库方言: {dialect_note}（只读查询，禁止 INSERT/UPDATE/DELETE/DDL）\n\n"
+        f"你是{p.domain}业务数据分析助手。用户用自然语言提问，你需要把问题转成一条 SQL。\n"
+        f"数据库方言: {dialect}（只读查询，禁止 INSERT/UPDATE/DELETE/DDL）\n\n"
         "要求:\n"
         "1. 只输出 SQL 本身，不要解释、不要 Markdown 代码块包裹、不要分号结尾外的多余内容；\n"
-        "2. 涉及金额单位一律保留原始币种 BRL，不要换算；\n"
+        f"2. 涉及金额单位一律保留原始币种 {p.currency}，不要换算；\n"
         "3. 时间比较用日期范围显式写出（如 purchase >= '2017-01-01' AND purchase < '2018-01-01'），"
         "不要用 strftime 模糊匹配；\n"
-        "4. 默认只统计已送达(delivered)订单，除非问题明确包含其他状态；\n"
+        f"4. 默认只统计已送达({p.default_status})订单，除非问题明确包含其他状态；\n"
         "5. 数值聚合保留两位小数；\n"
-        "6. 客户维度的去重/复购统计用 customer_unique_id（不是 customer_id）；\n"
+        f"6. 客户维度的去重/复购统计用 {p.dedup_key}（不是 customer_id）；\n"
         "7. 结果集加 LIMIT 1000 以内，防止打爆内存。\n\n"
         "以下是数据库 Schema（字段后的 -- 注释即字段含义）:\n\n"
         f"{schema_block}{few}\n\n"

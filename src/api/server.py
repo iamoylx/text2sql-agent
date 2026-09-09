@@ -44,6 +44,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from src.core.config import PROJECT_ROOT, settings
+from src.scenarios import get_profile
+
+_PROFILE = get_profile()
 
 app = FastAPI(title="Text2SQL Agent API", version="0.6.0")
 app.add_middleware(
@@ -191,8 +194,8 @@ def _ev(type_: str, **data: Any) -> dict:
 _WRITE_HINT_RE = re.compile(
     r"(插入|新增|添加|写入|录入|更新|修改|改成|改为|删除|删掉|清空|抹掉|去掉)"
 )
-_WRITE_SYS_PROMPT = """你是数据分析库的写操作助手。用户提出了一个可能涉及数据变更（增/删/改）的请求。
-你的任务：判断意图并生成**提案 SQL**（SQLite 方言，当前库为 Olist 电商数据）。
+_WRITE_SYS_PROMPT = f"""你是数据分析库的写操作助手。用户提出了一个可能涉及数据变更（增/删/改）的请求。
+你的任务：判断意图并生成**提案 SQL**（{_PROFILE.dialect} 方言，当前库为 {_PROFILE.db_desc}）。
 
 铁律：
 1. 若用户真实意图是查询/分析（哪怕提到"删除""修改"等词，如"被删除的订单有哪些"），输出 intent=read，不给 SQL。

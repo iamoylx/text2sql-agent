@@ -31,14 +31,16 @@ from src.agent.prompting import (
 )
 from src.core.config import settings
 from src.core.llm import get_llm
+from src.scenarios import get_profile
 from src.safety.validator import execute_with_timeout, validate_sql as run_validate
 
 # 防死循环双上限
 MAX_RETRY = 3          # 自愈最多重试次数（含首次在内共 3 次生成机会）
 TOKEN_BUDGET = 40000   # 单会话累计 token 上限（AGNES 免费额度保护）
 
+_PROFILE = get_profile()
 # 数据库里最大年份（无年份问题时用「最新完整年」兜底口径）
-_KNOWN_MAX_YEAR = 2018
+_KNOWN_MAX_YEAR = _PROFILE.known_max_year
 
 
 def _num_tokens(text: str) -> int:
@@ -91,8 +93,7 @@ _UNDERSTAND_PROMPT = """你是数据分析口径规范器。把用户的业务�
 3. 订单状态：默认统计 delivered（已送达），除非用户明确要求其他状态。
 4. 涉及「销售额/收入」默认含运费（price + freight_value），除非明确说商品金额。
 5. 客户维度去重/复购用 customer_unique_id。
-6. 用户点名要查的表若不在数据库 Schema 中（数据库只有 customers/orders/order_items/
-   order_payments/order_reviews/products/sellers/geolocation/product_category_translation），
+6. 用户点名要查的表若不在数据库 Schema 中（数据库只有 {catalog}），
    不得擅自映射到近似表，应在 clarified 中说明「数据库无此表」。
 7. 如果问题本身语义清晰无需改写，原样输出。
 只输出 JSON：{{"clarified": "改写后的查询需求", "notes": "口径说明，无则空字符串"}}"""
@@ -101,7 +102,8 @@ _UNDERSTAND_PROMPT = """你是数据分析口径规范器。把用户的业务�
 def understand(state: dict) -> dict:
     question = state["question"]
     llm = get_llm()
-    sys_p = _UNDERSTAND_PROMPT.format(max_year=_KNOWN_MAX_YEAR)
+    sys_p = _UNDERSTAND_PROMPT.format(max_year=_PROFILE.known_max_year,
+                                      catalog=_PROFILE.table_catalog)
     # AGNES 偶发空响应 → 重试一次（P1 踩坑迁移）
     raw = ""
     for _ in (1, 2):
@@ -241,7 +243,7 @@ def respond(state: dict) -> dict:
         return {
             "status": "ok",
             "message": f"查询执行成功，但【{q}】在数据范围内没有匹配记录（空结果）。\n"
-                       "可能原因：①时间范围超出 2016-09~2018-10；②口径过严。请调整条件后重试。",
+                       f"可能原因：①时间范围超出 {_PROFILE.data_range}；②口径过严。请调整条件后重试。",
             "result": [],
         }
     # 生成结果解读（LLM 总结，避免直接把大表格甩给用户）
