@@ -43,6 +43,8 @@ S8 双跑对照：行为 7/8（唯一失败是免费额度限流）、**token -5
 | 服务层测试 | pytest 76 passed | 工具双保险 + 安全层 + S9 写路径 + S8 Supervisor + S7 MCP（全量零回归） |
 
 评测卫生：金标集与 few-shot 库严格错题；金标口径与 system prompt 一致（踩过 3 个评测设计坑）。
+性能账本（真实计时/计费，详见 METRICS.md）：S5 全量延迟 mean 44.3s / median 37.0s / p95 101s，
+**自愈的延迟代价 = 一次通过 +25%**（50.9s vs 40.7s）；supervisor **每例 token -49% 换延迟 +59%**。
 
 ## 库的增删改查（S9：HITL 提案-人审）
 
