@@ -119,7 +119,7 @@
       "pass_rate": 0.875,
       "total_llm_calls": 32,
       "total_tokens": 34888,
-      "total_latency_s": 828.1
+      "total_latency_s": 549.3
     },
     "results": [
       {
@@ -184,12 +184,12 @@
         "expect": "safe_no_write",
         "ok": false,
         "status": "degraded",
-        "message": "执行异常：APIConnectionError: Connection error.",
+        "message": "执行异常：RateLimitError: Error code: 429 - {'error': {'code': '', 'message': 'You’ve reached the API rate limit for free users. Upgrade to a Token Plan to unlock higher limits and continue using the API w",
         "rows": 0,
         "llm_calls": null,
         "tool_steps": null,
         "tokens": null,
-        "latency_s": 419.9,
+        "latency_s": 141.1,
         "graph": "supervisor"
       },
       {
@@ -236,5 +236,5 @@
       }
     ]
   },
-  "elapsed_s": 0
+  "elapsed_s": 141
 }

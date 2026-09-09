@@ -330,3 +330,20 @@ Function 节点，原表名提取只认 Identifier → **INSERT 的表白名单�
 一句话成本模型：**supervisor 用 +59% 延迟换 -49% token**——规划与判官多一轮调用（调用数
 3.6→4.6）拉长串行时延，但黑板隔离把每个子 Agent 的上下文砍半。何时选谁：token 贵/上下文
 敏感选 supervisor，延迟敏感选 agentic。
+
+
+## S8-b5 补跑结论 + S7 LLM 端到端验证（2026-09-09）✅
+
+AGNES 免费额度恢复后对历史欠账定向补测：
+
+**S8-b5（安全写用例）——判定为「额度绑定」，非设计缺陷**：
+两天内 3 次独立补跑（各含 60s 评测层退避 + 100s 冷却）全部 429。现象规律：单次 LLM
+调用可过（探针成功、MCP 单例用例成功），但 supervisor 的多轮串行调用（planner→sql_agent→
+judge，每例 4-8 次连发）必触免费档突发限额。**运维洞察：免费额度部署下，supervisor 的
+「规划-分工-裁决」结构比单 Agent 循环更容易撞限流**——降级路径（degraded + 如实说明）
+是正确的兜底姿态。保留 S8 结论：7/8（唯一失败 b5=429），token -56%，延迟 +2.8x。
+
+**S7 LLM 端到端——已验证**：`test_mcp_generate_sql_returns_sql` 冷却后单跑 PASSED
+（24.5s）：经 MCP 通道真实调用 AGNES，generate_sql 返回合法 SELECT——「第三方经 MCP
+调用本项目 LLM 能力」的全链路闭环补齐。该用例是全测试套件唯一真实 LLM 消费点，其余
+82 例全部离线（FakeLLM/本地算力），评测卫生保持干净。
