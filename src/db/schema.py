@@ -5,7 +5,10 @@ Olist 数据库 Schema 定义（表名 / 字段类型 / 中文注释 / 采样值
 原理：
   - 「注释即知识」是 Text2SQL 的免费午餐——每个字段的中文注释（含枚举值含义）直接决定
     LLM 选表选列的准确率。这份定义同时服务于：
-    ① init_db.py 建表  ② schema.md 文档  ③ agent 的 prompt 注入（P2-S2 Schema 注入）
+    ① scripts/init_db.py 建表
+    ② 给人读的 data/schema.md（本模块 render_schema_md 生成，init_db.py --dump-schema 刷新）
+    ③ 给 LLM 的 prompt 注入（agent/prompting.render_schema_block，P2-S2 Schema 注入）
+    ② 与 ③ 是两个渲染器、两种受众，不要混用——详见 render_schema_md 的 docstring。
 """
 from __future__ import annotations
 
@@ -208,7 +211,17 @@ RELATIONS: list[str] = [
 
 
 def render_schema_md(row_counts: dict[str, int] | None = None) -> str:
-    """把 TABLES 渲染成带注释与采样值的 Markdown / prompt 注入文本。"""
+    """把 TABLES 渲染成**给人阅读**的 Markdown 文档（产物 data/schema.md，随仓库提交）。
+
+    与 prompt 路径的分工（别混用）：
+      - 本函数 → 人类读者：Markdown 表格 + 代码块，方便 review 表结构与字段含义；
+      - agent.prompting.render_schema_block → LLM：DDL + 行内 -- 注释 + 采样行，
+        更省 token 且列名与解释零距离对齐。
+    同一份 TABLES，两种受众，两种渲染形态。
+
+    调用点：scripts/init_db.py --dump-schema（建库后自动重新生成，保证文档与库同步）。
+    row_counts 可选：给定时在表名后标注行数，缺某表则跳过该标注（动态表可能不在库中）。
+    """
     lines = ["# Olist 数据库 Schema（中文注释）", ""]
     for name, t in TABLES.items():
         cnt = f"（{row_counts[name]:,} 行）" if row_counts and name in row_counts else ""

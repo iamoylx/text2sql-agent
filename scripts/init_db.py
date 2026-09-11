@@ -5,10 +5,18 @@
 用途：产出 data/db/olist.db（dev 库）。MySQL 版本见 README 的「切换 MySQL」小节——
      四层安全里的「只读账号 + MAX_EXECUTION_TIME」是 MySQL 特性，SQLite 开发库用
      URI mode=ro（只读打开）+ progress handler 超时做等价防护。
-运行：env -u PYTHONPATH python scripts/init_db.py
+
+建库完成后会自动调用 dump_schema() 重新生成 data/schema.md（给人读的 Schema 文档，
+随仓库提交）——保证「文档永远与库同步」，不需要手动记得去刷新。
+
+运行：
+  env -u PYTHONPATH python scripts/init_db.py                # 重建库 + 刷新 data/schema.md
+  env -u PYTHONPATH python scripts/init_db.py --dump-schema  # 只刷新文档，不重建库（快）
+  env -u PYTHONPATH python scripts/init_db.py --no-dump      # 只重建库，不动文档
 """
 from __future__ import annotations
 
+import argparse
 import sqlite3
 import sys
 import time
@@ -18,11 +26,12 @@ from pathlib import Path
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from src.db.schema import TABLES  # noqa: E402
+from src.db.schema import TABLES, render_schema_md  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 RAW = ROOT / "data" / "raw"
 DB = ROOT / "data" / "db" / "olist.db"
+SCHEMA_MD = ROOT / "data" / "schema.md"
 
 # CSV 文件名 → 表名映射（去 _dataset 后缀，与 schema.py 的表名一致）
 CSV_MAP = {
@@ -43,7 +52,37 @@ EXPECTED = {"customers": 99441, "orders": 99441, "order_items": 112650,
             "sellers": 3095, "geolocation": 1000163, "product_category_translation": 71}
 
 
-def main() -> None:
+def dump_schema(db_path: Path = DB, out_path: Path = SCHEMA_MD) -> Path | None:
+    """按当前库的真实行数重新生成 data/schema.md（给人读的 Schema 文档）。
+
+    - 表清单取自 TABLES（本脚本进程内即 9 张业务表）；
+    - 某表在库里查不到时**跳过行数标注而不是报错**：注册元数据可能先于建表落盘，
+      文档生成不该因此中断；
+    - 库不存在时直接跳过并提示（--dump-schema 在没建库的机器上不炸）。
+    """
+    if not db_path.exists():
+        print(f"[dump-schema] 库不存在，跳过：{db_path}")
+        return None
+    con = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
+    try:
+        row_counts: dict[str, int] = {}
+        for t in TABLES:
+            try:
+                row_counts[t] = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            except sqlite3.Error:
+                continue
+    finally:
+        con.close()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(render_schema_md(row_counts), encoding="utf-8")
+    missing = [t for t in TABLES if t not in row_counts]
+    tail = f"，缺表跳过 {missing}" if missing else ""
+    print(f"[dump-schema] 已刷新 {out_path}（{len(row_counts)} 张表{tail}）")
+    return out_path
+
+
+def rebuild_db() -> None:
+    """重建 dev 库：解压 → 读 9 张 CSV → 按 DDL 建表 → 入 SQLite → 校验行数。"""
     # geolocation 是 zip 包
     zipped = RAW / "olist_geolocation_dataset.zip"
     if zipped.exists() and not (RAW / "olist_geolocation_dataset.csv").exists():
@@ -77,5 +116,25 @@ def main() -> None:
     print(f"\n库已写入 {DB}  大小 {DB.stat().st_size/1e6:.1f} MB")
 
 
+def main(*, rebuild: bool = True, dump: bool = True) -> None:
+    if rebuild:
+        rebuild_db()
+    if dump:
+        dump_schema()
+
+
+def _cli() -> None:
+    ap = argparse.ArgumentParser(
+        description="初始化 Olist 开发库（并默认刷新 data/schema.md）")
+    ap.add_argument("--dump-schema", action="store_true",
+                    help="只重新生成 data/schema.md，不重建库（秒级）")
+    ap.add_argument("--no-dump", action="store_true",
+                    help="重建库但不刷新 data/schema.md")
+    a = ap.parse_args()
+    if a.dump_schema and a.no_dump:
+        ap.error("--dump-schema 与 --no-dump 互斥")
+    main(rebuild=not a.dump_schema, dump=not a.no_dump)
+
+
 if __name__ == "__main__":
-    main()
+    _cli()

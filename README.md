@@ -105,6 +105,8 @@ pip install -r requirements.txt
 
 # 2. 数据入库（Olist 公开数据集 9 表）
 python scripts/init_db.py
+#    建库后会自动刷新 data/schema.md（给人读的 Schema 文档，随仓库提交）
+#    单独刷新文档（不重建库）：python scripts/init_db.py --dump-schema
 
 # 3. 配置 LLM（.env）
 #    AGNES_API_KEY=...   （或 DEEPSEEK_API_KEY，config 留有备用位）
