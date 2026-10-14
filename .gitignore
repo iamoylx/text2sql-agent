@@ -9,9 +9,16 @@ __pycache__/
 
 # 数据（CSV 与数据库文件不入库）
 data/raw/
-data/db/
+# 注意：必须写成 data/db/*（而非 data/db/）——目录级忽略会让 git 整个跳过该目录，
+# 后面的「例外」规则永远不生效，custom_tables.json 也就无法入库
+data/db/*
 *.db
 *.sqlite
+# 例外：动态注册表元数据（很小且需入库，否则「CSV 导入的表重启自动恢复」会失效）
+!data/db/custom_tables.json
+
+# 本地学习手册（不入库：体量大，且非项目产物）
+docs/
 
 # 日志与临时
 logs/
