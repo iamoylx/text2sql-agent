@@ -24,6 +24,7 @@ from langgraph.graph import END, StateGraph
 
 from src.agent import nodes
 from src.agent.state import SQLAgentState
+from src.core.cost import BudgetExceeded
 
 
 def build_agent_graph():
@@ -68,13 +69,25 @@ def build_agent_graph():
     return graph, checkpointer
 
 
-def answer(graph, question: str, thread_id: str | None = None) -> dict:
+def answer(graph, question: str, thread_id: str | None = None,
+           callbacks=None) -> dict:
     """跑一次问答，返回最终完整 state（invoke 聚合所有节点增量）。
-    thread_id 用于多轮会话（checkpointer 持久化 messages）。"""
-    config = {"configurable": {"thread_id": thread_id or "default"}}
+    thread_id 用于多轮会话（checkpointer 持久化 messages）。
+
+    callbacks：可选，LangChain 回调列表（如 CostTracker）——挂上即可实测本条的
+    LLM 调用次数与 token/成本，**不改任何业务代码**。
+    """
+    config: dict = {"configurable": {"thread_id": thread_id or "default"}}
+    if callbacks:
+        config["callbacks"] = callbacks
     try:
         return graph.invoke({"question": question}, config=config)
+    except BudgetExceeded:
+        raise          # ★ 预算熔断必须穿透，见下方 except 的注释
     except Exception as e:  # 图内部异常兜底，返回可读错误
+        # 「兜底」与「熔断」的经典冲突：若把 BudgetExceeded 也兜成 degraded 返回，
+        # 评测脚本就永远收不到超预算信号，会一路把余额烧干（跑到一半断供、
+        # 整轮作废正是要避免的事）。故熔断异常单独放行。
         return {
             "question": question,
             "status": "degraded",

@@ -24,10 +24,43 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 from typing import Any
 
 from src.tools.registry import register_external_tool
+
+# MCP stdio 子进程的环境**不是**父进程 os.environ 的复制：SDK 只透传
+# get_default_environment() 的白名单（HOME/PATH/TERM… 本机实测 12 个变量）。
+# 于是「父进程明明有 DEEPSEEK_API_KEY，子进程却报 Missing credentials」——
+# 根因在传参层，不在密钥配置层。
+#
+# 修法刻意**不做 `**os.environ` 全量透传**：那会把父进程里所有密钥（数据库口令、
+# 云厂商 token、第三方 API key）一并塞进一个我们并未审计过全部代码的子进程，
+# 等于用一个「修好了」换一个「泄露面无限大」。正确姿势是显式白名单——
+# 子进程要自建 LLM 与只读连库，就只给它这两类凭据。
+_MCP_ENV_PASSTHROUGH = (
+    # LLM 凭据与选型（子进程 mcp_server.py 复用同一套 get_llm）
+    "DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_THINKING",
+    "AGNES_API_KEY", "AGNES_BASE_URL",
+    "LLM_PROVIDER", "LLM_MODEL",
+    # 数据源与场景（只读连接串；写口令 agent_rw 刻意**不在**白名单内）
+    "DB_URL", "DB_RO_URI", "SCENARIO",
+)
+
+
+def _child_env(extra: dict | None = None) -> dict[str, str]:
+    """构造 stdio 子进程环境：SDK 安全基线 + 显式白名单 + 调用方覆盖。"""
+    from mcp.client.stdio import get_default_environment
+
+    env = dict(get_default_environment())
+    for key in _MCP_ENV_PASSTHROUGH:
+        value = os.environ.get(key)
+        if value:
+            env[key] = value
+    if extra:
+        env.update({k: str(v) for k, v in extra.items()})
+    return env
 
 
 def _mcp_to_openai_schema(tool) -> dict:
@@ -65,13 +98,17 @@ class MCPToolBridge:
         return asyncio.run_coroutine_threadsafe(coro, self._ensure_loop()).result(timeout)
 
     # ---- 连接（stdio / http） ----
-    async def _connect_stdio(self, name: str, command: str, args: list[str]) -> None:
+    async def _connect_stdio(self, name: str, command: str, args: list[str],
+                             env: dict | None = None) -> None:
         from contextlib import AsyncExitStack
 
         from mcp import ClientSession, StdioServerParameters
         from mcp.client.stdio import stdio_client
 
-        params = StdioServerParameters(command=command, args=args)
+        # 必须显式给 env：SDK 在 server.env 为 None 时只透传安全白名单，
+        # 子进程读不到 LLM 凭据（见 _MCP_ENV_PASSTHROUGH 上方注释）
+        params = StdioServerParameters(command=command, args=args,
+                                       env=_child_env(env))
         # 常驻连接：AsyncExitStack 持住全部上下文——若不持有 CM 对象引用，
         # GC 回收任务组会直接把连接关掉（实测踩坑：连接秒断 "Connection closed"）
         stack = AsyncExitStack()
@@ -97,8 +134,9 @@ class MCPToolBridge:
         self._sessions[name] = session
         self._stacks[name] = stack
 
-    def connect_stdio(self, name: str, command: str, args: list[str]) -> None:
-        self._submit(self._connect_stdio(name, command, args), timeout=60)
+    def connect_stdio(self, name: str, command: str, args: list[str],
+                      env: dict | None = None) -> None:
+        self._submit(self._connect_stdio(name, command, args, env), timeout=60)
 
     def connect_http(self, name: str, url: str) -> None:
         self._submit(self._connect_http(name, url), timeout=60)
@@ -143,7 +181,8 @@ def enable_mcp_tools(server_specs: list[dict]) -> list[str]:
     """连接 MCP server → 发现工具 → 注册进 registry。
 
     server_specs 元素：
-      {"name": "别名", "transport": "stdio", "command": "...", "args": [...]}
+      {"name": "别名", "transport": "stdio", "command": "...", "args": [...],
+       "env": {...}}                        # env 可选，覆盖白名单里的同名项
       {"name": "别名", "transport": "http", "url": "http://host:port/mcp"}
 
     返回实际注册的工具名列表（与原生四工具同名的会被跳过——原生优先）。
@@ -153,7 +192,8 @@ def enable_mcp_tools(server_specs: list[dict]) -> list[str]:
     for spec in server_specs:
         name = spec["name"]
         if spec["transport"] == "stdio":
-            bridge.connect_stdio(name, spec["command"], spec.get("args") or [])
+            bridge.connect_stdio(name, spec["command"], spec.get("args") or [],
+                                 spec.get("env"))
         elif spec["transport"] == "http":
             bridge.connect_http(name, spec["url"])
         else:

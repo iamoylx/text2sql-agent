@@ -300,7 +300,65 @@ Function 节点，原表名提取只认 Identifier → **INSERT 的表白名单�
 3. **评测卫生的延续**：`test_mcp_generate_sql_returns_sql` 是全测试套件唯一依赖真实 LLM 的
    用例，AGNES 免费额度 429 时 pytest.skip（非代码缺陷）——与 S8 评测的限流口径一致。
 
-全量回归：**pytest 76 passed + 1 skipped 零回归**。
+**★ 子进程凭据缺口（2026-10-16 换 DeepSeek 时暴露）**：
+
+把 provider 从 AGNES 切到 DeepSeek 后，MCP 用例突然报 `Missing credentials`。
+排查**先读 SDK 源码、不猜**，拿到决定性一行（`mcp/client/stdio.py:127`）：
+
+```python
+env=({**get_default_environment(), **server.env} if server.env is not None
+     else get_default_environment())
+```
+
+即 `server.env is None` 时子进程**只拿到 SDK 的安全白名单**，不是父进程 `os.environ` 的复制。
+本机实测该白名单只有 **12 个变量**，且**全是纯系统变量、零凭据**：
+
+```
+APPDATA HOMEDRIVE HOMEPATH LOCALAPPDATA PATH PATHEXT
+PROCESSOR_ARCHITECTURE SYSTEMDRIVE SYSTEMROOT TEMP USERNAME USERPROFILE
+```
+
+父子环境对照实测（同一时刻）：
+
+| 检查项 | 结果 |
+|---|---|
+| 父进程 `os.environ["DEEPSEEK_API_KEY"]` | ✅ SET (len=35) |
+| `settings.llm_provider` / `llm_model` | ✅ deepseek / deepseek-flash |
+| 子进程基线白名单变量数 | ⚠️ 12 |
+| 白名单里含 `DEEPSEEK_API_KEY` | ❌ False |
+
+**为什么 AGNES 时代没暴露**：子进程的 pydantic-settings 会读 **CWD 的 `.env`**，而 `.env`
+里恰好有 `AGNES_API_KEY` —— 一直是**文件兜底**在起作用，不是环境继承。换成 deepseek 后
+`.env` 无对应项，兜底断了才浮出水面。**这是「换掉一个看似无关的依赖，暴露了被兜底掩盖的
+真实缺陷」的典型例子**，也说明「之前能跑」不能当作「设计正确」的证据。
+
+**修法：显式白名单，不做 `**os.environ` 全量透传**
+
+```python
+_MCP_ENV_PASSTHROUGH = (
+    "DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_THINKING",
+    "AGNES_API_KEY", "AGNES_BASE_URL", "LLM_PROVIDER", "LLM_MODEL",
+    "DB_URL", "DB_RO_URI", "SCENARIO",
+)   # ★ 写库口令 agent_rw 刻意不在名单内
+```
+
+全量透传会把父进程所有密钥（DB 口令、云 token、第三方 key）塞进一个我们并未逐行审计过的
+子进程——那是用「修好功能」换「泄露面无限大」。白名单让子进程恰好拿到「自建 LLM + 只读连库」
+所需，其余不给。
+
+**回归防线（零 LLM 消耗）**：`tests/test_mcp.py` 新增 3 条
+
+| 用例 | 钉住的性质 |
+|---|---|
+| `test_child_env_inherits_provider_key` | 当前 provider 的密钥必须在子进程环境里 |
+| `test_child_env_keeps_safe_baseline_and_no_secret_smuggling` | `PATH` 等基线仍在，且 `TAVILY_API_KEY` 等**非白名单密钥不得进**、环境里不得有写库口令 |
+| `test_child_env_extra_overrides_whitelist` | 调用方 `spec.env` 可覆盖白名单同名项 |
+
+**变异验证（防空气测试）**：把 `_child_env()` 换成「修复前」行为（只返回 SDK 基线白名单）
+跑同一套断言 → **FAIL**；修复后 → **PASS**。非空转。
+
+全量回归：**pytest 76 passed + 1 skipped 零回归** → 换 DeepSeek 后
+`pytest tests/test_mcp.py` **12 passed（含真实 LLM 用例，不再 skip）**。
 
 
 ## 延迟与成本统计（S8 复盘扩展，2026-09-09）✅
@@ -330,6 +388,12 @@ Function 节点，原表名提取只认 Identifier → **INSERT 的表白名单�
 一句话成本模型：**supervisor 用 +59% 延迟换 -49% token**——规划与判官多一轮调用（调用数
 3.6→4.6）拉长串行时延，但黑板隔离把每个子 Agent 的上下文砍半。何时选谁：token 贵/上下文
 敏感选 supervisor，延迟敏感选 agentic。
+
+> ⚠️ **本节结论已被 2026-10-16 的交叉验证订正，请以上方「真实 LLM 端到端」章节为准。**
+> 本节 token 数取自图内 `state.token_cost`；用 CostTracker 直接读 API usage 互校后发现
+> **agentic 侧少算 31.4%**（嵌套工具调用未入账，详见该章「S8 交叉验证暴露的计量不一致」）。
+> 同口径重算的差额是 **−9.8%**（而非 −49%/−56%），且在 DeepSeek 上未复现该优势。
+> 保留本节原文以记录「单一计量口径自证不了自己」这个过程。
 
 
 ## S8-b5 补跑结论 + S7 LLM 端到端验证（2026-09-09）✅
@@ -390,3 +454,131 @@ judge，每例 4-8 次连发）必触免费档突发限额。**运维洞察：�
 对纯取值来源重构这是可接受的取舍，但**它不构成端到端回归证据**——面试时这两句话不能混。
 
 复现：`python -m pytest tests/test_scenario.py -q`（6 passed，全离线，16s）
+
+
+## 真实 LLM 端到端：换 DeepSeek-V4.1-Flash 全量复跑（2026-10-16）✅
+
+**为什么换**：AGNES 免费档在 S5/S8 复跑时反复 429（S8-b5 三次补跑均限流），
+「质量结论被额度绑架」。DeepSeek-V4.1-Flash 单价低、无限流，可一次跑完三个评测。
+
+### 预算：先实测单价，再决定跑不跑
+
+不估算——先用**分层抽样**探路（7 种题型各取 1 条 + 2 条自愈题，共 8 条）：
+
+| 项 | 实测 |
+|---|---|
+| 探路 8 条成本 | **¥0.0216**（约 ¥0.0027/条） |
+| 缓存命中率 | **81.9%**（system prompt 的 schema 注入 + few-shot 每条完全相同，天然高命中） |
+| 外推全量 60 条 | ≈ **¥0.16**；即便自愈重试使其翻倍，也仅 ¥0.33 |
+| 当时余额 | ¥6.01 → **余量 18–37 倍，判定为「够，直接跑」** |
+
+★ 若一律按**未命中价**（¥2/M）估价，同一轮会被算成 ¥5+ 从而误判「跑不起」——
+**缓存命中率是成本估算里最不能省的一项**（见 `src/core/cost.py` 的键名兼容处理）。
+
+### 三个评测的实测结果（同一提供方、一次性跑完，无中断）
+
+| 评测 | 指标 | AGNES 基线 | **DeepSeek-V4.1-Flash** | 耗时 |
+|---|---|---|---|---|
+| S5 全量 60 条 | SQL 结果准确率 | 0.860 (43/50) | **0.780 (39/50)** | 460s |
+| | 端到端 ok | 0.8704 (47/54) | **0.7963 (43/54)** | |
+| | 安全拦截 | 6/6 | **6/6** | |
+| 自愈专项 | 自愈率 | 0.708 (17/24) | **0.708 (17/24)** | 100s |
+| S8 双编排 | agentic 正确率 | 1.0 (8/8) | **1.0 (8/8)** | 58s |
+| | supervisor 正确率 | 0.875 (7/8，唯一失败=429) | **1.0 (8/8)** | 90s |
+
+**成本合计 ≈ ¥0.29**（S5 ¥0.1755 + 自愈 ¥0.0354 + S8 ¥0.0729），S5 端到端 **460s vs AGNES 约 2658s（按 mean 44.3s/条）→ 快 5.8×**。
+
+**两个立刻可用的结论**：
+1. **自愈率两模型完全一致（0.708 vs 0.708）**，且 **S8 两张图都 8/8**——瓶颈不在生成器。
+2. DeepSeek 不限流 → **S8 首次拿到双编排都 8/8**，AGNES 时代 b5 永远卡在 429。
+
+### ★ 核心发现：那 −0.08 的「退化」全部来自评测资产缺陷，不是模型差异
+
+逐题对齐（按 question 原文，不用 id）后，DeepSeek 独有失败 5 条，逐条归因：
+
+| 类别 | 条数 | 题号 | 证据 |
+|---|---|---|---|
+| **prompt ↔ 金标口径互斥** | 3 | f06 / m06 / m10 | system prompt 明令「默认只统计已送达(delivered)订单，除非问题明确包含其他状态」（`agent/prompting.py:112`），而这三题**金标 SQL 里没有 `order_status` 过滤** → **遵守规则的模型必被扣分** |
+| **单位口径歧义** | 2 | d07 / g03 | 金标用**比例**(0-1, `ROUND(...,4)`)；模型用**百分比**(×100, 2 位)。题干「占比」两种读法都成立 |
+| **真实模型差异** | **0** | — | — |
+
+**口径修正后的分数对照**：
+
+| 口径 | AGNES SQL | DeepSeek SQL | Δ |
+|---|---|---|---|
+| 原始 60 条全量 | 0.8600 | 0.7800 | **−0.0800** |
+| 剔除「prompt↔金标互斥」3 条 | 0.8511 (47) | 0.8298 (47) | −0.0213 |
+| 再剔除「单位口径歧义」2 条 | 0.8444 (45) | **0.8667 (45)** | **+0.0222** |
+
+★ 第二行剔除是硬证据（prompt 与金标直接矛盾，两侧都不该计）；**第三行剔除是判断题**
+（「占比」按中文统计惯例更常读作比例，但百分比也说得通）——**两行都列出来，不挑好看的报**。
+而且 `src/scenarios/olist.py` 的 docstring 自己就写着「金标口径必须与本文件一致，
+否则评测失去区分度（S5 踩过的坑）」——这条纪律在这 3 道题上没被执行。
+
+### ★ 评测卫生：判据按措辞判分（已修）
+
+`empty_result` 原判据是**查关键词表** `["0 笔","不存在","无记录",...]`。
+换模型后暴露：AGNES 恰好说「0 笔」就过，DeepSeek 说「总销售额为 **null**，即没有数据」
+或「数量为 **0**」就被判错——**两者都是正确处理了「无此数据」**。
+
+改为**结果集语义比对**（与 normal 类同判准：空结果题的金标本就是 `COUNT=0` / `SUM=NULL`），
+关键词仅作拿不到 SQL 时的兜底。4 条专项验证 **4/4 全过**（e02/e04 从 FAIL 变 PASS），
+端到端因此 0.7593 → **0.7963**。
+
+★ 这是「**评测代码 bug 先于模型怀疑**」的又一例：换了模型，暴露的却是判据。
+**比较口径的不对称也要讲清楚**：新判据只落盘了 SQL，旧判据没落，且 AGNES 免费额度
+不可再跑 → 该修正**只能对 DeepSeek 侧复验，AGNES 侧无法追溯**。故上表另给了
+「剔除 empty_result」的对齐口径（两模型同判据、同 56 条样本）。
+
+### ★ 重复性：同模型同参数跑两次
+
+| 指标 | run1 | run2（判据修正后） | Δ |
+|---|---|---|---|
+| SQL 准确率 | 0.7800 (39/50) | 0.7800 (39/50) | **0.0000** |
+| 端到端 | 0.7593 (41/54) | 0.7963 (43/54) | +0.0370（全部来自判据修正） |
+| 逐题判定一致 | — | **56/60 = 0.933** | — |
+
+**56/60 的一致率就是单次对比的分辨率下限**：任何小于约 4/60 的差异都落在噪声里，
+不足以支撑「A 比 B 强」的结论。原 −0.08 的差距（5 条）**恰好就在这个量级边缘**。
+
+### ★ S8 交叉验证暴露的计量不一致（既有结论需订正）
+
+用 CostTracker（直接读 API usage）与图内记账（`state.token_cost`）**互校**，对不上：
+
+| 图 | 图内记账 token | CostTracker 实测 (in+out) | 一致？ |
+|---|---|---|---|
+| agentic | 47,870 | 65,807+4,048 = **69,855** | ❌ 少算 **31.4%** |
+| supervisor | 63,039 | 57,268+5,771 = **63,039** | ✅ 完全一致 |
+
+**根因已定位到代码**：`src/tools/registry.py:111 _tool_generate_sql` 是 agentic 图通过
+`bind_tools` 暴露的**工具**，其内部**自己调了一次 `get_llm()`**。模型委派该工具时产生
+**嵌套 LLM 调用**，而 `tools` 节点只回填工具结果、**不把嵌套调用的 token 计入 state**。
+（佐证：CostTracker 记到 **30** 次调用，图内 `steps` 只有 **24**。）
+
+**因此**：
+- 图中「**supervisor token −56%**」是拿**两个口径不一致的数**相除得来的，**跨编排比较不成立**；
+- 用同口径（API 实测）重算：agentic 69,855 vs supervisor 63,039 → **−9.8%**，不是 −56%；
+- 成本口径：agentic **¥0.0278** vs supervisor **¥0.0451** → supervisor **贵 62%**
+  （其缓存命中率 62.8% 明显低于 agentic 84.0%——判官/修订轮的上下文每轮都变，命中不了）。
+- **订正后的诚实表述**：换成不限流的提供方后，**两种编排都 8/8**；supervisor 的真实代价是
+  **延迟 +56%、成本 +62%**，而「token 更低」这一优势**未能在 DeepSeek 上复现**。
+
+★ 这个不一致**正是靠"加一个独立计量"才发现的**——单一计量口径自证不了自己。
+也说明**嵌套 LLM 调用是 token 记账的经典盲区**（P1 的 CostTracker 是用回调体系挂的，
+天然覆盖嵌套调用，这正是它比手写累加可靠的原因）。
+
+### 复现
+
+```bash
+# 探路定预算（~¥0.02，先分层抽样，不要拿最便宜的题估）
+.venv/Scripts/python.exe evals/run_eval_s5.py --tag pilot --only f01 m01 d01 a01 g01 e01 s01 f07 --cap 1.2
+# 三个评测（带 --tag 隔离，绝不覆盖 AGNES 基线；--fresh 忽略已满进度文件）
+.venv/Scripts/python.exe evals/run_eval_s5.py     --tag deepseek --fresh --cap 3.0
+.venv/Scripts/python.exe evals/run_selfheal_eval.py --tag deepseek --cap 2.0
+.venv/Scripts/python.exe evals/run_s8_dual.py      --tag deepseek --cap 3.0
+```
+
+**脚本卫生要点（都踩过）**：① 换提供方必须 `--tag`，否则进度文件已满会**一条都不跑**、
+把历史数字重新打印一遍，看起来像刚跑过；② `--cap` 熔断必须能穿透 `answer*` 的
+`except Exception` 兜底，否则熔断信号被吞成 `degraded`；③ 成本计量必须分**峰谷**
+（同为周五，16:39 峰时跑与 20:58 谷时跑，同量价差 2 倍）。

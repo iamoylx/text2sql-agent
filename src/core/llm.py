@@ -13,9 +13,23 @@ from langchain_openai import ChatOpenAI
 from src.core.config import settings
 
 
+def _deepseek_extra_body() -> dict:
+    """DeepSeek 思考模式开关（OpenAI 格式要求放在 extra_body 里）。
+
+    本项目**必须关掉**（见 config 里 deepseek_thinking 的注释）：
+    最硬的理由是带 tools 的请求在思考模式下要求回传 reasoning_content，否则 400，
+    而 LangChain 的工具调用循环不会替我们回传 —— 开着它，所有工具类节点都会挂。
+    """
+    mode = (settings.deepseek_thinking or "").strip().lower()
+    if mode in ("", "default"):
+        return {}
+    return {"thinking": {"type": mode}}
+
+
 def get_llm(*, streaming: bool = False) -> BaseChatModel:
     provider = settings.llm_provider
     if provider == "deepseek":
+        extra = _deepseek_extra_body()
         return ChatOpenAI(
             model=settings.llm_model,
             api_key=settings.deepseek_api_key,
@@ -24,6 +38,7 @@ def get_llm(*, streaming: bool = False) -> BaseChatModel:
             max_tokens=settings.llm_max_tokens,
             timeout=settings.llm_timeout,
             streaming=streaming,
+            **({"extra_body": extra} if extra else {}),
         )
     # 默认 agnes。max_retries=1：SDK 内置指数退避在 429 时会拖 10-20 分钟
     # （S8 双跑实测踩坑），重试职责上移给调用层（_llm_json 20s 退避 / 评测层 60s 退避）

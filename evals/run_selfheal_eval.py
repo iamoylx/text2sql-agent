@@ -17,10 +17,11 @@ P2-S5 自愈专项评测（补充主评测无法覆盖的自愈率指标）。
 自愈成功定义：修复后 SQL 可执行 且 结果集与金标一致。
 自愈率 = 修复成功条数 / 注入条数。验收 ≥0.60。
 
-运行：.venv/Scripts/python.exe evals/run_selfheal_eval.py
+运行：.venv/Scripts/python.exe evals/run_selfheal_eval.py [--tag deepseek] [--cap 2.0]
 """
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import sqlite3
@@ -36,6 +37,7 @@ from src.agent import nodes  # noqa: E402
 from src.agent.fewshot import FewShotRetriever  # noqa: E402
 from src.agent.prompting import build_system_prompt, render_fewshots_block, render_schema_block  # noqa: E402
 from src.core.config import settings  # noqa: E402
+from src.core.cost import CostTracker  # noqa: E402
 from src.safety.validator import execute_with_timeout  # noqa: E402
 from src.safety.validator import validate_sql as run_validate  # noqa: E402
 
@@ -87,7 +89,17 @@ def _exec_err(sql: str) -> str:
 
 
 def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tag", default=None,
+                    help="给本轮结果打标签（如 deepseek）：落独立结果文件，不覆盖既有基线")
+    ap.add_argument("--cap", type=float, default=None, help="成本上限（元），仅记录不熔断")
+    args = ap.parse_args()
+    out_path = ROOT / "evals" / "selfheal_result.json"
+    if args.tag:
+        out_path = ROOT / "evals" / f"selfheal_result.{args.tag}.json"
+
     gold = {x["id"]: x for x in json.loads(GOLDSET.read_text(encoding="utf-8"))}
+    tracker = CostTracker(cap_cny=args.cap)
     t0 = time.time()
     results = []
     total_injected = 0
@@ -114,16 +126,21 @@ def main() -> None:
                 "messages": [],
                 "token_cost": 0,
             }
-            upd = nodes.generate_sql(state)  # 内部读 sql_error 回写 user 消息重新生成
+            # 直接调节点（不走图）→ 无父 run 上下文，必须显式传回调才能记账
+            cost0, calls0 = tracker.cost_cny, tracker.calls
+            upd = nodes.generate_sql(state, callbacks=[tracker])
+            item_cost = round(tracker.cost_cny - cost0, 6)
             fixed_sql = (upd.get("sql") or "").rstrip(";")
             if not fixed_sql:
                 results.append({"id": cid, "kind": kind, "healed": False,
-                                "err": "generate 返回空 SQL", "elapsed_s": 0})
+                                "err": "generate 返回空 SQL", "elapsed_s": 0,
+                                "cost_cny": item_cost})
                 continue
             vr = run_validate(fixed_sql)
             if not vr.passed:
                 results.append({"id": cid, "kind": kind, "healed": False,
-                                "err": f"校验拦截: {vr.reason}", "sql": fixed_sql[:100]})
+                                "err": f"校验拦截: {vr.reason}", "sql": fixed_sql[:100],
+                                "cost_cny": item_cost})
                 continue
             # ⚠️ 用 sqlite3 直连执行拿 tuple rows——execute_with_timeout 返回 dict rows，
             # 与金标 tuple 混比会迭代出 dict key（曾致自愈全判错）
@@ -147,18 +164,23 @@ def main() -> None:
             healed += 1 if healed_ok else 0
             results.append({"id": cid, "kind": kind, "healed": healed_ok,
                             "err": "" if healed_ok else (xerr or "结果不匹配")[:120],
-                            "sql": fixed_sql[:140]})
+                            "sql": fixed_sql[:140], "cost_cny": item_cost})
             mark = "HEALED" if healed_ok else "FAIL"
-            print(f"[{mark}] {cid} {kind}: {err[:60]} -> {'ok' if healed_ok else 'x'}")
+            print(f"[{mark}] {cid} {kind}: {err[:60]} -> {'ok' if healed_ok else 'x'} "
+                  f"¥{item_cost:.4f}/{tracker.calls - calls0}call", flush=True)
 
     n = len(results)
     rate = healed / n if n else 0
     print(f"\n===== 自愈专项: {healed}/{n} = {rate:.3f} (验收 ≥0.60) =====")
-    (ROOT / "evals" / "selfheal_result.json").write_text(
+    print(f"本轮实测成本 ¥{tracker.cost_cny:.4f} | {tracker.calls} 次调用 "
+          f"| 输入 {tracker.input_tokens} tok（缓存命中 {tracker.cache_hit_rate:.1%}）"
+          f" | 输出 {tracker.output_tokens} tok", flush=True)
+    out_path.write_text(
         json.dumps({"healed": healed, "total": n, "rate": round(rate, 4),
-                    "results": results, "elapsed_s": round(time.time() - t0)},
+                    "results": results, "elapsed_s": round(time.time() - t0),
+                    "cost": tracker.as_dict()},
                    ensure_ascii=False, indent=2), encoding="utf-8")
-    print("已写入 evals/selfheal_result.json")
+    print(f"已写入 {out_path.relative_to(ROOT)}")
 
 
 if __name__ == "__main__":

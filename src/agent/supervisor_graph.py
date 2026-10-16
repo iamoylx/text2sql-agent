@@ -39,6 +39,7 @@ from langgraph.graph import END, StateGraph
 
 from src.agent.nodes import _account_usage
 from src.core.config import settings
+from src.core.cost import BudgetExceeded
 from src.core.llm import get_llm
 from src.scenarios import get_profile
 from src.safety.validator import execute_with_timeout, validate_sql
@@ -483,11 +484,20 @@ def build_supervisor_graph():
     return graph, checkpointer
 
 
-def answer_supervisor(graph, question: str, thread_id: str | None = None) -> dict:
-    """跑一次 Supervisor 问答，返回最终完整 state。thread_id 用于隔离多轮。"""
-    config = {"configurable": {"thread_id": thread_id or "supervisor-default"}}
+def answer_supervisor(graph, question: str, thread_id: str | None = None,
+                      callbacks=None) -> dict:
+    """跑一次 Supervisor 问答，返回最终完整 state。thread_id 用于隔离多轮。
+
+    callbacks：可选 LangChain 回调（如 CostTracker）。Supervisor 多智能体的核心
+    卖点之一就是「以更少 token 换更稳的质量」，这个账必须实测，不能估算。
+    """
+    config: dict = {"configurable": {"thread_id": thread_id or "supervisor-default"}}
+    if callbacks:
+        config["callbacks"] = callbacks
     try:
         return graph.invoke({"question": question}, config=config)
+    except BudgetExceeded:
+        raise          # 预算熔断放行，不被下面的兜底吞成 degraded
     except Exception as e:
         return {
             "question": question,

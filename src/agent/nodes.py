@@ -128,7 +128,13 @@ def understand(state: dict) -> dict:
 
 # ---------------- 节点 2：generate_sql ----------------
 
-def generate_sql(state: dict) -> dict:
+def generate_sql(state: dict, callbacks=None) -> dict:
+    """生成/修复 SQL。
+
+    callbacks：可选。图内调用时**不需要**传——LangChain 回调会沿 run 树自动传播
+    （评测挂 CostTracker 即可全程记账）。但自愈专项评测等场景会**直接调用本节点**
+    而不经过图，此时没有父 run 上下文，必须显式传入才能记账。
+    """
     q = state.get("clarified_question") or state["question"]
     schema_block, fewshots = _build_context(q)
     # 错误回喂：把上一次的执行错误写进 user 消息，模型据此修复（ReAct 的 Observe→Reason）
@@ -147,7 +153,8 @@ def generate_sql(state: dict) -> dict:
     for _ in (1, 2):
         resp = llm.invoke(
             [SystemMessage(content=sys_prompt),
-             HumanMessage(content=q + err_feedback)]
+             HumanMessage(content=q + err_feedback)],
+            **({"config": {"callbacks": callbacks}} if callbacks else {}),
         )
         raw = (resp.content or "").strip()
         if raw:

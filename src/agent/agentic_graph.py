@@ -35,6 +35,7 @@ from langgraph.graph import END, StateGraph
 from src.agent.nodes import _account_usage  # 复用 token 记账（跨节点单一实现）
 from src.agent.state import SQLAgentState
 from src.core.config import settings
+from src.core.cost import BudgetExceeded
 from src.core.llm import get_llm
 from src.scenarios import get_profile
 from src.tools.registry import TOOL_SCHEMAS, dispatch
@@ -223,11 +224,20 @@ def build_agentic_graph():
     return graph, checkpointer
 
 
-def answer_agentic(graph, question: str, thread_id: str | None = None) -> dict:
-    """跑一次 agentic 问答，返回最终完整 state。thread_id 用于隔离多轮。"""
-    config = {"configurable": {"thread_id": thread_id or "agentic-default"}}
+def answer_agentic(graph, question: str, thread_id: str | None = None,
+                   callbacks=None) -> dict:
+    """跑一次 agentic 问答，返回最终完整 state。thread_id 用于隔离多轮。
+
+    callbacks：可选 LangChain 回调（如 CostTracker）——S8 双编排对照要按编排
+    分别记账（agentic vs supervisor 的 token/成本对比是核心结论之一）。
+    """
+    config: dict = {"configurable": {"thread_id": thread_id or "agentic-default"}}
+    if callbacks:
+        config["callbacks"] = callbacks
     try:
         return graph.invoke({"question": question}, config=config)
+    except BudgetExceeded:
+        raise          # 预算熔断放行，不被下面的兜底吞成 degraded
     except Exception as e:
         return {
             "question": question,

@@ -38,6 +38,14 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.0           # SQL 生成要确定性，温度 0
     llm_max_tokens: int = 4096             # agnes 需 >=256，过小会整段空
     llm_timeout: int = 120
+    # DeepSeek-V4 起「思考模式」默认开启（effort=high）。本项目**必须关掉**，两个硬理由：
+    #   ① 本项目大量用 bind_tools / tool_calls。思考模式下带 tools 的请求要求把
+    #      reasoning_content 完整回传，否则 API 直接返回 400；而 LangChain 的工具
+    #      调用循环不会替我们回传 → 工具类节点必挂。
+    #   ② 思维链 token 计入**输出**计费（成本高数倍），且会吃掉 max_tokens 预算
+    #      （与 Agnes 那个「过小则 content 整段空」同款坑）。
+    # 取值：disabled | enabled（想看思考模式对 SQL 生成准确率的增益时改这项）
+    deepseek_thinking: str = "disabled"
 
     # ---------- 评测用金标库 / Few-shot 库路径 ----------
     goldset_path: str = str(PROJECT_ROOT / "evals" / "goldset.json")

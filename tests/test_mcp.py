@@ -172,3 +172,54 @@ def test_mcp_to_openai_schema_shape():
     assert s["function"]["name"] == "my_tool"
     assert s["function"]["description"] == "do things"   # strip 生效
     assert s["function"]["parameters"]["type"] == "object"
+
+
+# ---------------- ⑥ 子进程凭据传递（零 LLM 消耗的回归防线）----------------
+#
+# 背景（真实踩坑）：MCP stdio 子进程的环境不是父进程 os.environ 的复制——SDK 只透传
+# get_default_environment() 的白名单（本机实测仅 12 个变量）。切到 DeepSeek 后子进程
+# 报 "Missing credentials"，根因在**传参层**而非密钥配置层。
+# 之前 AGNES 能跑只是巧合：子进程的 settings 会读 CWD 的 .env，而 .env 正好有
+# AGNES_API_KEY 兜底；换成 deepseek 后 .env 里没有对应项，兜底失效才暴露出来。
+#
+# 这组用例不连 LLM、不花钱，专防「换 provider 又静默漏凭据」。
+
+def test_child_env_inherits_provider_key():
+    """当前 provider 的密钥必须出现在子进程环境里（否则子进程建 LLM 必失败）。"""
+    import os
+
+    from src.core.config import settings
+    from src.mcp_client import _child_env
+
+    env = _child_env()
+    provider = settings.llm_provider
+    key_name = f"{provider.upper()}_API_KEY"
+    if not os.environ.get(key_name):
+        pytest.skip(f"父进程本就没有 {key_name}（本机未配置），无法验证透传")
+    assert env.get(key_name) == os.environ[key_name], (
+        f"子进程环境缺少 {key_name} —— MCP stdio 默认白名单不透传密钥，"
+        f"需加入 _MCP_ENV_PASSTHROUGH")
+
+
+def test_child_env_keeps_safe_baseline_and_no_secret_smuggling():
+    """白名单不是全量透传：安全基线（PATH 等）要在，非白名单密钥不进。
+    这是「修好功能」与「不放大泄露面」之间的边界断言。
+    """
+    import os
+
+    from src.mcp_client import _child_env, _MCP_ENV_PASSTHROUGH
+
+    env = _child_env()
+    assert env.get("PATH"), "PATH 必须有，否则子进程起不来"          # SDK 基线仍在
+    assert "TAVILY_API_KEY" not in env, "非白名单密钥不得进子进程"     # 刻意的边界
+    assert "TAVILY_API_KEY" not in _MCP_ENV_PASSTHROUGH, "白名单本身也不该收编无关密钥"
+    # 写口令不能进子进程：读路径的子进程没有写权限的必要
+    assert not any("RW" in k or "PASSWORD" in k.upper() for k in env), \
+        "子进程环境不得包含写库口令"
+
+
+def test_child_env_extra_overrides_whitelist():
+    """调用方 spec.env 可覆盖白名单同名项（如给某 server 换模型）。"""
+    from src.mcp_client import _child_env
+
+    assert _child_env({"LLM_MODEL": "x-probe"}).get("LLM_MODEL") == "x-probe"
