@@ -345,5 +345,48 @@ judge，每例 4-8 次连发）必触免费档突发限额。**运维洞察：�
 
 **S7 LLM 端到端——已验证**：`test_mcp_generate_sql_returns_sql` 冷却后单跑 PASSED
 （24.5s）：经 MCP 通道真实调用 AGNES，generate_sql 返回合法 SELECT——「第三方经 MCP
-调用本项目 LLM 能力」的全链路闭环补齐。该用例是全测试套件唯一真实 LLM 消费点，其余
-82 例全部离线（FakeLLM/本地算力），评测卫生保持干净。
+调用本项目 LLM 能力」的全链路闭环补齐。
+
+**测试套件里的真实 LLM 消费点（订正：不是「唯一」，是两条且形态不同）**：
+
+| 用例 | 门控形态 | 本次实测 |
+|---|---|---|
+| `tests/test_mcp.py::test_mcp_generate_sql_returns_sql` | **自动跳过**：429/限流 → skip；排队超时（>120s）→ skip | SKIPPED（429） |
+| `tests/test_tools.py::(真实 LLM 用例)` | **主动门控**：需 `RUN_SLOW=1` 才跑，默认跳过以免烧 token | SKIPPED（未设 RUN_SLOW） |
+| 其余 81 例 | 全离线（FakeLLM / 本地算力），评测卫生保持干净 | 81 passed |
+
+> 原文写「唯一真实 LLM 消费点」不准确，已订正。同时修掉一个**评测假象**：
+> 该 MCP 用例原先只处理「网关返回 429（错误在 dict 的 `error` 字段里）」这一种失败形态，
+> 而免费档排队过久时 `_submit` 的 `.result(timeout)` 会抛 `TimeoutError`——**不是 dict**，
+> 直接冒泡成测试失败，于是限流时全量跑出 1 failed 而非 1 skipped。
+> 修法：`except TimeoutError: pytest.skip(...)` + 超时放宽到 120s（免费档「慢但能用」不该被误判成失败）。
+> 教训与 P1 的「评测代码 bug 先于模型怀疑」同源——**依赖外部服务的用例，必须把该服务的每种
+> 失败形态都映射成 skip，否则红/绿取决于当天额度**。
+
+## 场景包（Scenario Pack）：业务外壳可插拔（2026-09-08）✅
+
+**问题**：业务口径（默认状态 `delivered`、去重键 `customer_unique_id`、币种 BRL、数据范围、
+业务表枚举）原本**散落在 5 个 prompt 里**。改一个口径 = 改 5 个地方且**必然漏改**；
+而漏改的后果在评测上是**区分度丢失**——金标口径与 prompt 口径不一致时，模型「遵守规则」却被判错
+（S5 已踩过这个坑，见「全量评测」一节的口径一致性条目）。
+
+**做法**：把「随业务变化的口径级参数」收进一个 **frozen dataclass**（`src/scenarios/base.py`），
+引擎与业务外壳解耦。
+
+| 项 | 实测 |
+|---|---|
+| 数据契约字段数 | **10**（name / domain / dialect / known_max_year / data_range / table_catalog / default_status / dedup_key / currency / db_desc） |
+| 消费点（`get_profile()` 调用处） | **5 处**：`agent/nodes.py`、`agent/agentic_graph.py`、`agent/supervisor_graph.py`、`agent/prompting.py`、`api/server.py` |
+| 契约测试 | `tests/test_scenario.py` **6 passed** |
+| 换场景演示（医疗） | 断言 4 项切换到位（`医疗业务数据分析助手` / `PostgreSQL` / `CNY` / `patient_uid`+`completed`）且 **Olist 口径残留 = 0**（`BRL` 与 `customer_unique_id` 均不得出现） |
+
+**字段取舍原则（防过度抽象）**：只收「**多个 prompt 共用、且随业务变化**」的值；
+单处使用或纯模板措辞留在各 prompt 里。反例：`db_desc` 只进 1 处但也收了，
+因为它是「换业务必须改」的描述——判据是**变化频率**而非使用次数。
+
+**「行为零变化」的准确表述（诚实）**：本次是**取值来源**的重构（硬编码字面量 → 从 profile 取），
+验证靠的是**prompt 内容断言**（6 用例逐项检查口径关键词在位）**而非重跑 60 条评测**。
+即「渲染结果等价」有测试证据；「模型输出分布不变」是推断，未测量。
+对纯取值来源重构这是可接受的取舍，但**它不构成端到端回归证据**——面试时这两句话不能混。
+
+复现：`python -m pytest tests/test_scenario.py -q`（6 passed，全离线，16s）

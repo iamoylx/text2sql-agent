@@ -26,6 +26,12 @@ system prompt，保证人人问出一致口径。
 S8 双跑对照：行为 7/8（唯一失败是免费额度限流）、**token -56%**、延迟 +2.8 倍（诚实代价）。
 前端「Supervisor 多智能体」按钮可现场演示判官打回循环。
 
+![Supervisor 多智能体](assets/supervisor-judge-loop.png)
+
+> 上图：顶部编排切换按钮可见当前处于 **Supervisor 多智能体**。结论卡里的「数据覆盖完整 / 去重处理 /
+> 结果有效性」三项是子 Agent 分工产出后经判官门控通过的内容——**口径自检写进回答本身**，
+> 而不是让用户自己去核对（业务取数最怕的是「数字对了但口径错了」）。
+
 ## 实测指标（全部真实跑出，详见 METRICS.md）
 
 | 指标 | 数字 | 说明 |
@@ -40,7 +46,7 @@ S8 双跑对照：行为 7/8（唯一失败是免费额度限流）、**token -5
 | Supervisor 离线用例 | 5/5 | S8：FakeLLM 驱动全图（happy path / 判官打回循环 / 安全降级 / 规划纠偏） |
 | CTE 白名单用例 | 4/4 | S8 连带修复：WITH 别名不被误杀、不掩盖真越权表 |
 | MCP 协议用例 | 9/9 | S7：stdio/http 双传输回环 + 安全不旁路 + 第三方工具动态注册 |
-| 服务层测试 | pytest 76 passed | 工具双保险 + 安全层 + S9 写路径 + S8 Supervisor + S7 MCP（全量零回归） |
+| 服务层测试 | pytest **81 passed + 2 skipped** | 工具双保险 + 安全层 + S9 写路径 + S8 Supervisor + S7 MCP + 场景包；跳过的 2 条是**依赖真实 LLM** 的用例（免费额度不可用时自动跳过，非代码缺陷） |
 
 评测卫生：金标集与 few-shot 库严格错题；金标口径与 system prompt 一致（踩过 3 个评测设计坑）。
 性能账本（真实计时/计费，详见 METRICS.md）：S5 全量延迟 mean 44.3s / median 37.0s / p95 101s，
@@ -56,6 +62,12 @@ S8 双跑对照：行为 7/8（唯一失败是免费额度限流）、**token -5
 4. `/api/confirm` 复检三道闸 → **独立写凭据**（SQLite 去 mode=ro；MySQL 形态 agent_rw 账号）事务执行 → `write_audit.jsonl` 审计留痕
 
 数据接入：左栏「＋ 导入CSV」→ 表名/列名清洗 + 类型推断 + 行数质检 → **动态注册进白名单与 Schema 注入**（重启自动恢复），Agent 下一句即可查询新表。
+
+![写路径 HITL](assets/write-proposal-hitl.png)
+
+> 上图一次演示里同时可见两个状态：**提案未执行**（INSERT 卡 + 事务 dry-run 算出的「预估影响 1 行」
+> + 目标表白名单校验 + 风险说明）与**人审通过后**（「已执行·实际影响 1 行（审计已记录）」）。
+> 左栏底部的 `csv_region_targets` 就是 CSV 导入后**动态注册**的新表。
 
 ## MCP 对外开放 + 第三方工具接入（S7）
 
@@ -74,6 +86,24 @@ S8 双跑对照：行为 7/8（唯一失败是免费额度限流）、**token -5
   ```
 - 经 MCP 调 `DROP TABLE` / 查白名单外表**照样被四层安全拦截**；
   与原生同名的第三方工具被跳过（原生优先），新工具经 Pydantic 校验通道 dispatch（无旁路）。
+
+## 业务外壳可插拔：场景包（Scenario Pack）
+
+引擎与业务口径**解耦**——把「随业务变化的口径级参数」收进一个不可变数据类，换场景不改图/安全/工具一行代码。
+
+| | |
+|---|---|
+| 定义 | `src/scenarios/base.py::ScenarioProfile`（frozen dataclass，10 个字段） |
+| 内置 | `src/scenarios/olist.py::OLIST`（电商 / SQLite / 数据范围 2016-09~2018-10 / 默认状态 `delivered` / 去重键 `customer_unique_id` / 币种 BRL / 业务表枚举） |
+| 消费点 | **5 处**：`agent/nodes.py`、`agentic_graph.py`、`supervisor_graph.py`、`agent/prompting.py`、`api/server.py` |
+| 契约测试 | `tests/test_scenario.py`（6 用例，含**医疗场景换装演示**：换成 patient 表 + 挂号状态口径，断言 prompt 随之变化） |
+
+**字段取舍原则**：只收「多个 prompt 共用、且随业务变化」的值；单处使用或纯模板措辞留在各 prompt 里——避免过度抽象。
+
+**为什么值得做**：口径散落在 5 个 prompt 里时，「改一个业务口径」= 改 5 个地方且**必然漏改**；
+而漏改的后果在评测上是**区分度丢失**——金标口径与 prompt 口径不一致时，模型「遵守规则」却被判错
+（S5 踩过这个坑）。收进 frozen dataclass 后改口径只改一个文件，并由测试钉住
+「改 profile → 全部 prompt 同步变化」这条性质。
 
 ## 架构
 
@@ -139,15 +169,20 @@ python -m pytest -q                  # 单测
 | 9 | `src/api/server.py` | FastAPI + SSE 真流式（producer thread + queue）；事件归一化；输出净化 |
 | 10 | `web/index.html` | 原生 JS 三栏布局；SSE 消费；markdown 逐行渲染；ECharts |
 | 11 | `src/mcp_server.py` + `src/mcp_client.py` | **MCP 双向**：FastMCP 工具开放（复用 registry）+ AsyncExitStack 客户端 + 动态注册 |
-| 12 | `evals/run_eval_s5.py` | 评测框架：金标比对 / 断点续跑 / 结果归因 |
-| 13 | `METRICS.md` | 全部指标数字与踩坑记录（面试素材库） |
+| 12 | `src/scenarios/base.py` + `olist.py` | **场景包**：口径级参数收进 frozen dataclass，5 个消费点零改动换业务外壳 |
+| 13 | `evals/run_eval_s5.py` | 评测框架：金标比对 / 断点续跑 / 结果归因 |
+| 14 | `METRICS.md` | 全部指标数字与踩坑记录（面试素材库） |
 
 ## 已知边界与生产化路线（诚实清单）
 
 数据层当前为开发期一次性导入的静态快照；生产落地还需：
 企业数据链路（ETL/CDC → 分析从库，Agent 只当读者）、SSO/RBAC 行列权限与审计、
-PII 脱敏、schema 变更感知与 schema linking、并发/缓存/限流、Docker 部署、
-写操作走「提案-人审-执行」（LangGraph interrupt）。详见 METRICS.md 与构建历程图。
+PII 脱敏、schema 变更感知与 schema linking、并发/缓存/限流、Docker 部署。
+
+**写路径的「提案-人审-执行」已实现**（S9，走 SSE `proposal` 事件 + `/api/confirm` 复检三道闸），
+剩余的是更成熟的形态：用 LangGraph `interrupt` 支持**可中断/可恢复**的长事务审批、
+并发场景下的提案状态管理（当前提案活在单次请求的生命周期内）。
+详见 METRICS.md 与构建历程图。
 
 ## License
 

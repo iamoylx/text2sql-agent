@@ -68,8 +68,21 @@ def test_mcp_select_roundtrip(bridge):
 
 
 def test_mcp_generate_sql_returns_sql(bridge):
-    """唯一依赖真实 LLM 的用例：AGNES 免费额度 429 时 skip（与 S8 评测口径一致）。"""
-    out = bridge.call("p2", "generate_sql", {"question": "2017年有多少笔订单？"})
+    """唯一依赖真实 LLM 的用例：AGNES 免费额度不可用时 skip（与 S8 评测口径一致）。
+
+    ★ 这里必须处理**两种**失败形态，而不只是一种（踩过）：
+      · 网关返回 429 / 限流 → bridge.call 正常返回 dict，错误在 `error` 字段里；
+      · 免费档排队过久 → `_submit` 的 `.result(timeout)` 抛 TimeoutError，**不是 dict**，
+        会直接冒泡成测试失败。
+    此前只判了第一种，于是限流时测试报 TimeoutError 红而非 skip——
+    在「全量零回归」的口径下这属于**评测假象**（同 P1 的「评测代码 bug 先于模型怀疑」）。
+    另外把超时放宽到 120s：免费档「慢但能用」不该被误判成失败。
+    """
+    try:
+        out = bridge.call("p2", "generate_sql",
+                          {"question": "2017年有多少笔订单？"}, timeout=120)
+    except TimeoutError:
+        pytest.skip("LLM 免费额度排队超时（>120s），非代码缺陷")
     if out.get("ok") is False and ("429" in out.get("error", "")
                                    or "限流" in out.get("error", "")):
         pytest.skip("LLM 免费额度 429 限流，非代码缺陷")
