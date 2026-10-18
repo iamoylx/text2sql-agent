@@ -126,14 +126,27 @@ def test_judge_generate_sql_distinguishes_two_kinds_of_red():
     assert _judge_generate_sql({"ok": True, "sql": "not sql"}, credentials_present=True)[0] == "fail"
 
 
+@pytest.mark.skipif(
+    os.environ.get("RUN_SLOW") != "1",
+    # 刻意不把通过数写进 reason：数字会随测试增减漂移，写死只会让 skip 文案变成过期信息
+    reason="真实 LLM 用例：默认跳过，使「同一份代码在任何机器上结果一致」；"
+           "要跑全量设 RUN_SLOW=1（还需配好凭据）")
 def test_mcp_generate_sql_returns_sql(bridge):
-    """唯一依赖真实 LLM 的用例。**前置条件显式化，不靠运行者的 shell。**
+    """唯一依赖真实 LLM 的用例。**两道门，各管一件事。**
 
-    判据来自 `settings`（部署配置的唯一入口：它已合并 .env 与进程环境），
-    而不是 `os.environ.get("AGNES_API_KEY")` 这种「看跑测试的人当前 shell 有什么」的写法
-    ——后者会让「同一份代码在 A 机器绿、B 机器 skip」，红绿取决于机器。
+    ① `RUN_SLOW=1`（`skipif`）：管**通过数可复现**。默认跳过 → 任何机器都是 129 passed /
+       2 skipped，跟你有没有 key 无关；要跑真 LLM 才显式开。这与 `test_tools.py` 里那条
+       真 LLM 用例同一个开关，口径统一。
+    ② 凭据检查（函数体里）：管**开了开关之后的下一次失败**。`RUN_SLOW=1` 但没配 key 时，
+       给一条点名变量的 skip，而不是让 SDK 抛一个指向 `OPENAI_API_KEY` 的红。
 
-    判定交给 `_judge_generate_sql`：凭据不在 → skip；凭据在却报缺 → **红**（传参层 bug）。
+    ★ 凭据在不在 → 分两种处置（本轮重点）：
+      · 凭据**不在**（部署没配）→ `skip`，写清缺哪个变量；
+      · 凭据**在**却仍报缺 → **必须红**：说明 `_MCP_ENV_FROM_SETTINGS` 白名单或 stdio 传参层
+        有 bug（凭据没送进子进程），是**代码缺陷**，不是环境问题。
+    判定逻辑抽在 `_judge_generate_sql()` 里并有独立单测——因为加了 server 启动期体检后，
+    这条分支对自家 server 已不可达（子进程启动即退），埋在这里等于永远没人验。
+
     另需处理网关侧排队超时（`_submit` 的 `.result(timeout)` 抛 `TimeoutError`，**不是 dict**）。
     """
     from src.core.llm import has_llm_credentials
@@ -716,3 +729,45 @@ def test_allow_degraded_starts_with_only_three_tools_and_warns():
         f"其余 3 个工具必须照常在（它们不需要 LLM），实际：{names}"
     err = proc.stderr.decode("utf-8", "replace")
     assert "WARN" in err and "DEEPSEEK_API_KEY" in err, f"降级必须留声，实际：{err[:300]}"
+
+
+def test_build_server_is_the_only_construction_path(monkeypatch):
+    """★ 换入口也绕不过体检——因为构造 server 只剩 build_server 一条路。
+
+    · 缺凭据 + 不降级 → 抛 `MissingCredentialError`。注意是**抛**、不是 `sys.exit`：
+      库代码不该杀进程，退出码是 CLI 边界的事（这样 `build_server()` 才能被测试直接调用）。
+    · 缺凭据 + `allow_degraded=True` → 能拿到 server，但工具集里**没有** generate_sql
+      （fail-closed：没有凭据就不给用不了的工具）。
+    """
+    from src import mcp_server
+    from src.core.config import settings
+    from src.core.llm import MissingCredentialError
+
+    monkeypatch.setattr(settings, "llm_provider", "deepseek")
+    monkeypatch.setattr(settings, "deepseek_api_key", "")
+
+    with pytest.raises(MissingCredentialError):
+        mcp_server.build_server()
+
+    server = mcp_server.build_server(allow_degraded=True, quiet=True)
+    assert sorted(server._tool_manager._tools) == sorted(
+        ["execute_readonly_sql", "compute_metric", "render_chart"])
+
+
+def test_import_entry_does_not_die_and_stays_fail_closed():
+    """import 型入口（`mcp dev` / `from src.mcp_server import mcp`）的两条要求。
+
+    ① 不能 `sys.exit`——否则 `python -c "import src.mcp_server"` 会被直接杀掉
+       （以前体检在 `__main__` 里，import 入口干脆没体检；现在是 fail-closed，语义更强）；
+    ② 不能带病暴露——模块级对象在缺凭据时**只有 3 个工具**；
+    ③ 仍然不许污染 stdout（import 时也不许有杂音）。
+    """
+    env = _env_without_credentials()
+    code = ("import sys, src.mcp_server as m; "
+            "print('tools=', len(m.mcp._tool_manager._tools), file=sys.stderr)")
+    proc = subprocess.run([sys.executable, "-c", code], cwd=str(ROOT), env=env,
+                          capture_output=True, timeout=90)
+
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")[:300]
+    assert proc.stdout.strip() == b"", "import 入口也不许污染 stdout"
+    assert "tools= 3" in proc.stderr.decode("utf-8", "replace"), "缺凭据时必须是 fail-closed 的 3 工具"
