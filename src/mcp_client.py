@@ -24,10 +24,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 from typing import Any
 
+from src.core.llm import MissingCredentialError, require_llm_credentials
 from src.tools.registry import register_external_tool
+
+log = logging.getLogger(__name__)
 
 # MCP stdio 子进程的环境**不是**父进程 os.environ 的复制：SDK 只透传
 # get_default_environment() 的白名单（HOME/PATH/TERM… 本机实测 12 个变量）。
@@ -209,15 +213,71 @@ def get_bridge() -> MCPToolBridge:
     return _BRIDGE
 
 
-def enable_mcp_tools(server_specs: list[dict]) -> list[str]:
+# ---------------- 凭据体检闸（启动期，零 LLM 消耗） ----------------
+# 判据按**工具集**而不是按 server 名/配置：`execute_readonly_sql` / `compute_metric` /
+# `render_chart` 都不调 LLM，只有 `generate_sql` 会建客户端。这样第三方 server
+# （天气、日历…）不会因为「我们自己没配 LLM key」而被拦住——那才是真的误拦。
+_LLM_DEPENDENT_TOOLS: frozenset[str] = frozenset({"generate_sql"})
+
+
+def _needs_llm_credentials(spec: dict, tools) -> bool:
+    """该 server 是否依赖 LLM 凭据。
+
+    优先用 spec 里显式声明的 `requires_llm`（第三方 server 可能把 LLM 藏在
+    一个看不出名字的工具后面）；未声明则按工具集自动判定。
+    """
+    flag = spec.get("requires_llm")
+    if flag is not None:
+        return bool(flag)
+    return any(getattr(t, "name", "") in _LLM_DEPENDENT_TOOLS for t in tools)
+
+
+def _gate_llm_credentials(server_name: str, needs: bool, strict: bool) -> bool:
+    """凭据闸。返回 True=可以注册工具；False=显式降级跳过（仅 strict=False）。
+
+    strict=True 抛 `MissingCredentialError`：部署错误必须在部署时刻暴露。
+    strict=False 打 WARNING 后跳过：**这是「不暴露工具」唯一合法的用法**——
+    有意的降级，且留下了声音；而不是悄悄少给模型几个工具（那叫静默失败）。
+    """
+    if not needs:
+        return True
+    try:
+        require_llm_credentials()
+        return True
+    except MissingCredentialError as exc:
+        first_line = str(exc).splitlines()[0].strip()
+        if strict:
+            # 保留多行完整修法（缺哪个变量 / .env 还是 setx / 怎么验证）——
+            # 这条是抛给**人**看的部署错误，压缩成一行反而丢信息。
+            raise MissingCredentialError(
+                f"MCP server '{server_name}' 暴露了依赖 LLM 的工具，但{exc}"
+            ) from exc
+        log.warning(
+            "MCP server '%s' 的工具未注册（凭据缺失，strict=False 显式降级）：%s",
+            server_name, first_line,      # 日志只留首行：点名到变量即可，修法见 ensure 文档
+        )
+        return False
+
+
+def enable_mcp_tools(server_specs: list[dict], *, strict: bool = True) -> list[str]:
     """连接 MCP server → 发现工具 → 注册进 registry。
 
     server_specs 元素：
       {"name": "别名", "transport": "stdio", "command": "...", "args": [...],
-       "env": {...}}                        # env 可选，覆盖白名单里的同名项
+       "env": {...},                        # env 可选，覆盖白名单里的同名项
+       "requires_llm": True}                # 可选：显式声明该 server 依赖 LLM 凭据
       {"name": "别名", "transport": "http", "url": "http://host:port/mcp"}
 
     返回实际注册的工具名列表（与原生四工具同名的会被跳过——原生优先）。
+
+    **凭据体检（本版新增）**：`list_tools` 本身不调 LLM，所以凭据缺失时连接与
+    注册都会成功，失败是**惰性**的——要等第一次真正调 `generate_sql` 才炸，
+    还会被上层兜成 degraded。于是这里在**注册前**补一道闸：若该 server 的工具集
+    里含依赖 LLM 的工具，而当前 provider 的凭据没配好，就当场处理。
+
+    strict=True（默认）：抛 `MissingCredentialError`，把部署错误暴露在**启动时**。
+    strict=False：打 WARNING 并**跳过该 server 的工具注册**（模型看不到这些工具）。
+        这是唯一的「不暴露工具」合法场景——显式降级，且日志里有声音。
     """
     bridge = get_bridge()
     registered: list[str] = []
@@ -230,7 +290,10 @@ def enable_mcp_tools(server_specs: list[dict]) -> list[str]:
             bridge.connect_http(name, spec["url"])
         else:
             raise ValueError(f"未知 MCP transport: {spec['transport']}")
-        for tool in bridge.list_tools(name):
+        tools = bridge.list_tools(name)
+        if not _gate_llm_credentials(name, _needs_llm_credentials(spec, tools), strict):
+            continue          # 显式降级：已打 WARNING，该 server 的工具一个都不注册
+        for tool in tools:
             disp = (lambda sn, tn: lambda args: bridge.call(sn, tn, args))(name, tool.name)
             reg = register_external_tool(_mcp_to_openai_schema(tool),
                                          tool.inputSchema or {}, disp)

@@ -57,8 +57,8 @@ system prompt，保证人人问出一致口径。
 | 写路径安全用例 | 18/18 | S9 HITL：三道闸 8 + dry-run 零副作用 3 + commit/审计 2 + CSV 导入 5 |
 | Supervisor 离线用例 | 5/5 | S8：FakeLLM 驱动全图（happy path / 判官打回循环 / 安全降级 / 规划纠偏） |
 | CTE 白名单用例 | 4/4 | S8 连带修复：WITH 别名不被误杀、不掩盖真越权表 |
-| MCP 协议用例 | **16/16** | S7：stdio/http 双传输回环 + 安全不旁路 + 第三方工具动态注册 + **子进程凭据白名单 7 条**（含真实 LLM 用例，不再 skip） |
-| 服务层测试 | pytest **114 passed，0 skipped** | 工具双保险 + 安全层 + S9 写路径 + S8 Supervisor + S7 MCP + 场景包 + 成本计量；**换 DeepSeek 后原本"因额度跳过"的 2 条真实 LLM 用例也真的跑起来了**（AGNES 时代长期 81 passed + 2 skipped） |
+| MCP 协议用例 | **27/27** | S7：stdio/http 双传输回环 + 安全不旁路 + 第三方工具动态注册 + **子进程凭据白名单 7 条** + **凭据失败形态 11 条（含接线与反向对照）**（含真实 LLM 用例，不再 skip） |
+| 服务层测试 | pytest **125 passed，0 skipped** | 工具双保险 + 安全层 + S9 写路径 + S8 Supervisor + S7 MCP + 场景包 + 成本计量；**换 DeepSeek 后原本"因额度跳过"的 2 条真实 LLM 用例也真的跑起来了**（AGNES 时代长期 81 passed + 2 skipped） |
 
 评测卫生：金标集与 few-shot 库严格错题；金标口径与 system prompt 一致（踩过 3 个评测设计坑）。
 性能账本（真实计时/计费，详见 METRICS.md）：S5 全量延迟 mean 44.3s / median 37.0s / p95 101s，
@@ -122,6 +122,28 @@ token、第三方 key）一并塞进一个我们并未逐行审计过的子进�
 `tests/test_mcp.py` 有 **7 条零 LLM 消耗**的用例钉住这条边界（其中`test_child_env_takes_value_from_settings_not_environ`
 用**冲突值**做决定性断言：`os.environ` 与 `settings` 给不同的 key，子进程必须拿到 settings 那份）。
 两次变异验证非空转——回退成读 `os.environ` → 4 红；白名单里塞一个不存在的字段名 → 字段存在性检查当场报错。
+
+**凭据缺失怎么失败：启动期 fail-fast，调用期结构化错误**
+
+`list_tools` 本身不调 LLM，所以凭据缺失时**连接与注册都会成功**，失败是**惰性**的——
+等第一次真正调 `generate_sql` 才炸，还被上层兜成 `degraded`。用户看到的是「Agent 好像不太会
+写 SQL」，而不是「你少配了一个变量」。现状修成两层：
+
+- **启动期**：`enable_mcp_tools(...)` 在注册前过一道闸——该 server 的工具集里含 `generate_sql`
+  （或 spec 显式声明 `"requires_llm": true`）而当前 provider 的 key 为空时，抛
+  `MissingCredentialError`，文案写清「缺哪个变量 / 写 `.env` 还是 `setx` / 怎么验证」。
+  传 `strict=False` 则改为**打 WARNING 并跳过该 server 的工具注册**——这是「不暴露工具」
+  唯一合法的用法：显式降级、且留了声音。
+- **调用期**：`_tool_generate_sql` 把 SDK 原话（`openai.OpenAIError: Missing credentials.
+  Please pass an api_key … or set OPENAI_API_KEY`）翻译成
+  `{"ok": false, "error_code": "MISSING_CREDENTIALS", "retryable": false, "error": "缺少 LLM 凭据：…DEEPSEEK_API_KEY…"}`。
+  两个理由：**SDK 指向的 `OPENAI_API_KEY` 我们根本不用**，报错必须点名真实变量；
+  ToolMessage 是**喂给模型**的，`retryable: false` 明确叫它别重试，否则它会当成「工具坏了，换一个试试」白烧步数。
+
+判据按**工具集**而不是按 server 名：`execute_readonly_sql` / `compute_metric` / `render_chart`
+都不建 LLM 客户端，只有 `generate_sql` 会——否则第三方天气/日历 server 会因为**我们自己没配
+LLM key** 被误拦。这条边界有 11 条零 LLM 用例 + 4 次变异验证守着（去掉结构化错误 → 1 红；闸门失效 → 2 红；
+判定一律「需要凭据」→ 2 红；**删掉主流程里的闸门调用 → 2 红而 9 条叶子用例全绿**）。
 
 ## 业务外壳可插拔：场景包（Scenario Pack）
 

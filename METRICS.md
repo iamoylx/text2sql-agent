@@ -20,7 +20,7 @@
 | 2 | supervisor「token 更低」这一优势 | 视为普惠结论 | **未复现**（DeepSeek 上成本反 **+62%**） | 模型行为不同：supervisor 每次修订的上下文都在变，缓存命中率 **62.8%**，远低于 agentic 的 **84.0%** | 同上；「何时选谁」的推荐口径 |
 | 3 | S5 端到端（DeepSeek） | 0.7593（41/54） | **0.7963**（43/54） | `empty_result` 判据从「查关键词」改为「结果集语义比对」，纠正 2 条**答对却被判错**的用例 | S5 章节、README 指标表 |
 | 4 | S8 supervisor 正确率（DeepSeek） | 0.875（7/8） | **1.000（8/8）** | 原 7/8 的唯一失败 b5 是 AGNES 免费额度 429，换不限流提供方后不再发生 | S8 章节、README 指标表 |
-| 5 | 测试总数 | 81 passed + **2 skipped** | **114 passed / 0 skipped** | 新增 24 条成本计量单测 + MCP 子进程凭据用例 3→7 条（净 +4）；那 2 条真 LLM 用例现可跑（不再因额度跳过）。注：换 DeepSeek 当次为 110，任务 A 增测后为 114 | README 测试小节 |
+| 5 | 测试总数 | 81 passed + **2 skipped** | **125 passed / 0 skipped** | 新增 24 条成本计量单测 + MCP 子进程凭据用例 3→7 条（净 +4）+ 凭据失败形态 11 条；那 2 条真 LLM 用例现可跑（不再因额度跳过）。注：换 DeepSeek 当次 110 → 任务 A 后 114 → 失败形态补齐后 125 | README 测试小节 |
 | 6 | MCP 子进程凭据取值源 | `os.environ` | **`settings`** | 只读 `os.environ` 会漏掉**只写在 `.env` 里**的值（AGNES 时代靠子进程自己读 CWD 的 `.env` 兜底才没出事） | `src/mcp_client.py`、README MCP 章节 |
 
 **判定规则（防再次踩坑）**：
@@ -409,13 +409,13 @@ CWD 的 `.env` 兜底（同一处兜底掩盖了同一个缺陷两次）。改�
 > 也会通过——**通过的可能是量级巧合，不是设计正确**。给两个来源喂**不同的值**，
 > 才能把「从哪儿取」这件事变成一个可判定的可观测量。
 
-回归计数（2026-10-18 重跑）：`pytest tests/test_mcp.py` → **16 passed（含真实 LLM 用例，不再 skip）**；
-全量 `RUN_SLOW=1 pytest tests/` → **114 passed / 0 skipped**（换 DeepSeek 当次为 110，
-本段用 7 条替掉旧的 3 条，净 +4），零回归。
+回归计数（2026-10-18 重跑）：`pytest tests/test_mcp.py` → **27 passed（含真实 LLM 用例，不再 skip）**；
+全量 `RUN_SLOW=1 pytest tests/` → **125 passed / 0 skipped**（换 DeepSeek 当次为 110；
+本段 7 条替掉旧的 3 条净 +4 → 114，第 ⑦ 段 11 条 → 125），零回归。
 
 ### 追问：运行者既没 `.env` 也没环境变量时，这个 MCP 工具该怎么优雅失败？
 
-**先说现状（比"优雅失败"更糟）**：`enable_mcp_tools()` → `connect_stdio` → `list_tools`
+**修复前的现状（比"优雅失败"更糟，2026-10-18 已修，见下「落地情况」）**：`enable_mcp_tools()` → `connect_stdio` → `list_tools`
 **全程不调用 LLM**，所以凭据缺失时**连接照样成功、四个工具照样注册**。失败是**惰性**的——
 要等到第一次真正调 `generate_sql`，`get_llm()` 才抛 `OpenAIError: Missing credentials`，
 再被 `answer_agentic` 的 `except Exception` 兜成 `degraded`。用户看到的是
@@ -446,9 +446,63 @@ CWD 的 `.env` 兜底（同一处兜底掩盖了同一个缺陷两次）。改�
 
 一句话：**默认 fail-fast 报缺凭据；「不暴露」只能当显式开关，且必须带日志。**
 
-> 状态：本节是设计答复，**代码尚未落地**（当前实现就是上面描述的「惰性失败」）。
-> 落地点已定位：`src/mcp_client.py::enable_mcp_tools`（启动期）+
-> `src/tools/registry.py::_tool_generate_sql`（调用期）。
+#### 落地情况（2026-10-18 已实现，非纸面方案）
+
+| 落点 | 实现 | 关键设计取舍 |
+|---|---|---|
+| `src/core/llm.py` | 新增 `MissingCredentialError` + `require_llm_credentials()`；`get_llm()` **第一行就体检** | 单一真相源：所有调 `get_llm()` 的路径（MCP server、registry、react 图）都拿到同一条可执行的报错，不会各有各的说法 |
+| `src/tools/registry.py::_tool_generate_sql` | 只包住 `get_llm()`，返回 `{"ok": false, "error_code": "MISSING_CREDENTIALS", "retryable": false, "error": <首行>}` | 回喂模型**只给一行**（不塞整段修法手册），`retryable=False` 明确叫它别重试 |
+| `src/mcp_client.py::enable_mcp_tools` | 新增 `strict=True` 参数；`list_tools` 之后、注册之前过一道 `_gate_llm_credentials` | 见下「为什么不按 server 名判断」 |
+
+**判据按「工具集」而不是按 server 名/配置**：`execute_readonly_sql` / `compute_metric` /
+`render_chart` 都不建 LLM 客户端，只有 `generate_sql` 会。若按「凡是 MCP server 就要求凭据」
+判断，第三方天气/日历 server 会因为**我们自己没配 LLM key** 而被误拦——那才是真 bug。
+需要时可用 spec 里 `"requires_llm": true/false` 显式覆盖（第三方把 LLM 藏在一个看不出
+名字的工具后面时用得着）。
+
+**报错文案为什么不复用 SDK 原话**：`openai.OpenAIError` 说的是
+「Please pass an `api_key` … or set the `OPENAI_API_KEY` environment variable」——
+**把我们的人指向了本项目根本不用的变量名**（我们是 `DEEPSEEK_API_KEY` / `AGNES_API_KEY`）。
+报错必须点名到真实变量，并给出「`.env` 写一行 / `setx` 设用户级变量 / 一条验证命令」三步。
+
+**新增 11 条零 LLM 用例**（`tests/test_mcp.py` 第 ⑦ 段，全部 monkeypatch 伪造 settings / 假桥）：
+
+| 用例 | 钉住的性质 |
+|---|---|
+| `test_get_llm_missing_key_raises_typed_error_naming_real_variable` | ★环境变量里**有** key、settings 里**没有** → 仍必须失败；且文案含 `DEEPSEEK_API_KEY`、**不含** `OPENAI_API_KEY` |
+| `test_require_llm_credentials_rejects_unknown_provider` | provider 拼错不猜默认，报错给出可选值 |
+| `test_generate_sql_returns_structured_error_and_marks_not_retryable` | 结构化 dict：`error_code` / `retryable=False` / 单行文案 |
+| `test_needs_llm_credentials_detects_from_tool_set` | 判据来自工具集（三个本地工具 → False；加 `generate_sql` → True） |
+| `test_needs_llm_credentials_spec_override_wins` | 显式声明优先于自动判定 |
+| `test_gate_raises_in_strict_mode_with_server_context` | strict 报错带 server 名 + 变量名 |
+| `test_gate_degrades_with_warning_when_not_strict` | 非 strict 返回 False **且必须留 WARNING**（`caplog` 断言） |
+| `test_gate_does_not_block_servers_without_llm_tools` | ★反误拦：我们没配 key 不连累不依赖 LLM 的第三方 server |
+| `test_enable_mcp_tools_wires_the_gate` | ★**接线**：闸门必须真的被 `enable_mcp_tools` 调用（假桥，不拉子进程不联网） |
+| `test_enable_mcp_tools_skips_registration_when_degraded` | 非 strict 下**一个工具都不注册**（返回空）且留 WARNING |
+| `test_enable_mcp_tools_registers_normally_when_credentials_present` | **反向对照**：凭据齐备时闸门不得妨碍注册（否则前两条绿得毫无意义） |
+
+**变异验证（三条，各只改一件事，均已回滚、0 残留）**：
+
+| 变异 | 实测 |
+|---|---|
+| M3：`_tool_generate_sql` 去掉 `except MissingCredentialError` 分支 | **1 红**（结构化错误那条），异常直接穿透 |
+| M4：`_gate_llm_credentials` 开头直接 `return True`（闸门失效） | **2 红**（strict 不抛 + 非 strict 不降级） |
+| M5：`_needs_llm_credentials` 一律返回 True | **2 红**（工具集判定 + spec 覆盖） |
+| M6：删掉 `enable_mcp_tools` 主流程里那行闸门调用 | **2 红**，而 9 条辅助用例**全绿**——见下 |
+
+> **M6 是本轮最有价值的变异**：它把「函数正确」与「函数被调用」这两个性质彻底分开了。
+> 删掉主流程里那一行 `if not _gate_llm_credentials(...)` 之后，9 条测辅助函数的用例**全绿**
+> （每个函数各司其职、单测都过），只有 2 条接线用例报红——线上却已经退回到惰性失败。
+> **只测叶子函数、不测调用点，是重构/改动里最容易漏的一类空转测试。**
+>
+> 同理 M5 下 `test_gate_does_not_block_servers_without_llm_tools` 仍然绿：它显式传
+> `needs=False`，绕过了判定函数。**一条用例只能对应一个性质**，别指望它顺带看住别的。
+>
+> **过程中的自伤**：新加的接线用例调 `enable_mcp_tools` 注册了一个 `weather_now`，而
+> `register_external_tool` 改的是**模块级全局** `TOOL_SCHEMAS` / `PARAM_MODELS`，测试结束
+> 没恢复 → `tests/test_tools.py::test_tool_schemas_are_four_functions` 报「多了 weather_now」。
+> 该文件本来就有 `_fresh_registry` 快照 fixture，我漏挂。教训：**定向跑（`-k`）绿不代表全量绿**，
+> 但凡测试会改全局状态，就必须挂快照 fixture；而**只有一次完整跑才能发现这类跨文件污染**。
 
 
 ## 延迟与成本统计（S8 复盘扩展，2026-09-09）✅
@@ -511,7 +565,7 @@ judge，每例 4-8 次连发）必触免费档突发限额。**运维洞察：�
 | 其余 81 例 | 全离线（FakeLLM / 本地算力），评测卫生保持干净 | 81 passed |
 
 > 上表是 **AGNES 时代的历史快照**（当时那两条只能 skip）。换 DeepSeek 后两条均真跑，
-> 当前计数见文首「数字变更记录」第 5 行（**114 passed / 0 skipped**）。
+> 当前计数见文首「数字变更记录」第 5 行（**125 passed / 0 skipped**）。
 
 > 原文写「唯一真实 LLM 消费点」不准确，已订正。同时修掉一个**评测假象**：
 > 该 MCP 用例原先只处理「网关返回 429（错误在 dict 的 `error` 字段里）」这一种失败形态，

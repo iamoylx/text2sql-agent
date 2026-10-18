@@ -23,7 +23,7 @@ from pydantic import ValidationError
 from src.agent.fewshot import FewShotRetriever
 from src.agent.prompting import build_system_prompt, render_fewshots_block, render_schema_block
 from src.core.config import settings
-from src.core.llm import get_llm
+from src.core.llm import MissingCredentialError, get_llm
 from src.safety.validator import execute_with_timeout, validate_sql as run_validate
 from src.tools.models import PARAM_MODELS, json_schema_to_pydantic
 
@@ -113,7 +113,19 @@ def _tool_generate_sql(p: dict) -> dict:
     schema_block, fewshots = _build_context(q)
     sys_prompt = build_system_prompt(schema_block=schema_block,
                                      fewshots_block=render_fewshots_block(fewshots))
-    llm = get_llm()
+    # 凭据缺失必须翻译成**结构化错误**再回喂模型，理由有两条：
+    #   ① ToolMessage 是喂给模型的。SDK 原话「Missing credentials. Please pass an
+    #      `api_key` … or set `OPENAI_API_KEY`」会让它解读成「这工具坏了，换一个试试」
+    #      → 白烧步数；而且指向的变量名我们根本不用。
+    #   ② retryable=False 是明确告诉模型别重试：缺配置不是「换个参数再来一次」能解决的。
+    #      对比：安全拦截返回的 {"ok": False, "blocked": True} 隐含「换条 SQL 可以」。
+    try:
+        llm = get_llm()
+    except MissingCredentialError as e:
+        return {"ok": False,
+                "error_code": "MISSING_CREDENTIALS",
+                "retryable": False,
+                "error": str(e).splitlines()[0].strip()}
     resp = llm.invoke([("system", sys_prompt), ("user", q)])
     raw = (resp.content or "").strip()
     # 解析：优先代码块，其次裸 SQL
