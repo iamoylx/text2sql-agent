@@ -16,6 +16,9 @@ P2-S7 MCP 集成测试：真实协议回环（stdio 子进程拉起 MCP server�
 """
 from __future__ import annotations
 
+import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -27,19 +30,35 @@ SERVER = ROOT / "src" / "mcp_server.py"
 
 @pytest.fixture(scope="module")
 def bridge():
+    """常驻 stdio 会话。
+
+    ★ 凭据不在时用 `--allow-degraded` 起：server 仍能提供 3 个不需要 LLM 的工具，
+    只有 generate_sql 缺席（要它的用例自行 skip）。
+    否则 server 的启动期体检会硬失败（exit 1），**整个文件里那些压根不需要 LLM 的用例
+    全部 error**——用「安全启动」误伤了不该依赖它的测试。
+    """
+    from src.core.llm import has_llm_credentials
     from src.mcp_client import MCPToolBridge
+
+    args = [str(SERVER)] + ([] if has_llm_credentials() else ["--allow-degraded"])
     b = MCPToolBridge()
-    b.connect_stdio("p2", sys.executable, [str(SERVER)])
+    b.connect_stdio("p2", sys.executable, args)
     yield b
 
 
 # ---------------- ① 协议回环 ----------------
 
-def test_list_tools_discovers_four(bridge):
+def test_list_tools_discovers_expected_tools(bridge):
+    """工具集随凭据状态二态：齐备 4 个；缺失（降级启动）3 个 —— 但**不许静默少给**。"""
+    from src.core.llm import has_llm_credentials
+
     tools = bridge.list_tools("p2")
     names = {t.name for t in tools}
-    assert {"generate_sql", "execute_readonly_sql",
-            "compute_metric", "render_chart"} <= names
+    assert {"execute_readonly_sql", "compute_metric", "render_chart"} <= names
+    if has_llm_credentials():
+        assert "generate_sql" in names
+    else:
+        assert "generate_sql" not in names, "缺凭据时不该暴露用不了的工具"
     for t in tools:
         assert t.inputSchema.get("type") == "object"
         assert t.description  # 每个工具都有描述（模型选工具的依据）
@@ -69,26 +88,75 @@ def test_mcp_select_roundtrip(bridge):
     assert out["rows"][0]["n"] > 0
 
 
-def test_mcp_generate_sql_returns_sql(bridge):
-    """唯一依赖真实 LLM 的用例：AGNES 免费额度不可用时 skip（与 S8 评测口径一致）。
+def _judge_generate_sql(out: dict, *, credentials_present: bool) -> tuple[str, str]:
+    """把 generate_sql 的结果判成三类：`ok` / `skip:<原因>` / `fail:<原因>`。
 
-    ★ 这里必须处理**两种**失败形态，而不只是一种（踩过）：
-      · 网关返回 429 / 限流 → bridge.call 正常返回 dict，错误在 `error` 字段里；
-      · 免费档排队过久 → `_submit` 的 `.result(timeout)` 抛 TimeoutError，**不是 dict**，
-        会直接冒泡成测试失败。
-    此前只判了第一种，于是限流时测试报 TimeoutError 红而非 skip——
-    在「全量零回归」的口径下这属于**评测假象**（同 P1 的「评测代码 bug 先于模型怀疑」）。
-    另外把超时放宽到 120s：免费档「慢但能用」不该被误判成失败。
+    抽成**纯函数**的理由：Task B 的核心规则是「凭据不在 → skip；凭据在却报缺 → 红」，
+    而后者在加了 server 启动期体检之后，对自家 server **已不可达**（子进程直接退出，
+    根本走不到调用期）。埋在真 LLM 用例里的分支等于永远没人验——所以把判定逻辑提出来，
+    用几条纯单测把规则钉死，真 LLM 用例只负责拿回 out 再交给它判。
     """
+    err = str(out.get("error", ""))
+    missing = out.get("error_code") == "MISSING_CREDENTIALS" or "Missing credentials" in err
+    if missing:
+        if credentials_present:
+            return "fail", ("凭据在 settings 里已就位，但子进程仍报缺凭据——"
+                            f"这是白名单/传参层 bug，不是环境问题：{err[:200]}")
+        return "skip", "前置条件不成立：当前 provider 的凭据未配置（部署问题，非代码缺陷）"
+    if out.get("ok") is False and ("429" in err or "限流" in err):
+        return "skip", "LLM 免费额度 429 限流，非代码缺陷"
+    if out.get("ok") is True and str(out.get("sql", "")).upper().lstrip().startswith("SELECT"):
+        return "ok", ""
+    return "fail", f"既不是成功也不是已知非缺陷形态，需要人看：{out}"
+
+
+def test_judge_generate_sql_distinguishes_two_kinds_of_red():
+    """★ Task B 的规则本身：同样是「缺凭据」这条报错，凭据在不在 → 一个红一个 skip。"""
+    missing = {"ok": False, "error_code": "MISSING_CREDENTIALS",
+               "retryable": False, "error": "缺少 LLM 凭据：provider='deepseek' 需要 DEEPSEEK_API_KEY"}
+
+    assert _judge_generate_sql(missing, credentials_present=False)[0] == "skip"
+    assert _judge_generate_sql(missing, credentials_present=True)[0] == "fail"
+    # SDK 原话（没有 error_code 的老形态）也要能认出来，否则修完文案前的老包会被判成 skip
+    sdk_form = {"ok": False, "error": "Missing credentials. Please pass an `api_key`"}
+    assert _judge_generate_sql(sdk_form, credentials_present=True)[0] == "fail"
+    assert _judge_generate_sql({"ok": False, "error": "HTTP 429 rate limited"},
+                               credentials_present=True)[0] == "skip"
+    assert _judge_generate_sql({"ok": True, "sql": "SELECT 1"}, credentials_present=True)[0] == "ok"
+    assert _judge_generate_sql({"ok": True, "sql": "not sql"}, credentials_present=True)[0] == "fail"
+
+
+def test_mcp_generate_sql_returns_sql(bridge):
+    """唯一依赖真实 LLM 的用例。**前置条件显式化，不靠运行者的 shell。**
+
+    判据来自 `settings`（部署配置的唯一入口：它已合并 .env 与进程环境），
+    而不是 `os.environ.get("AGNES_API_KEY")` 这种「看跑测试的人当前 shell 有什么」的写法
+    ——后者会让「同一份代码在 A 机器绿、B 机器 skip」，红绿取决于机器。
+
+    判定交给 `_judge_generate_sql`：凭据不在 → skip；凭据在却报缺 → **红**（传参层 bug）。
+    另需处理网关侧排队超时（`_submit` 的 `.result(timeout)` 抛 `TimeoutError`，**不是 dict**）。
+    """
+    from src.core.llm import has_llm_credentials
+
+    present = has_llm_credentials()
+    if not present:
+        from src.core.config import settings
+        from src.core.llm import _PROVIDER_CREDENTIAL
+        pair = _PROVIDER_CREDENTIAL.get((settings.llm_provider or "").strip().lower())
+        env_name = pair[1] if pair else f"{str(settings.llm_provider).upper()}_API_KEY"
+        pytest.skip(f"前置条件不成立：provider={settings.llm_provider} 缺 {env_name}，"
+                    f"本用例需要真实 LLM；配好凭据后会自动开始跑")
+
     try:
         out = bridge.call("p2", "generate_sql",
                           {"question": "2017年有多少笔订单？"}, timeout=120)
     except TimeoutError:
         pytest.skip("LLM 免费额度排队超时（>120s），非代码缺陷")
-    if out.get("ok") is False and ("429" in out.get("error", "")
-                                   or "限流" in out.get("error", "")):
-        pytest.skip("LLM 免费额度 429 限流，非代码缺陷")
-    assert out.get("ok") is True
+
+    verdict, reason = _judge_generate_sql(out, credentials_present=present)
+    if verdict == "skip":
+        pytest.skip(reason)
+    assert verdict == "ok", reason
     assert out["sql"].upper().lstrip().startswith("SELECT")
 
 
@@ -457,6 +525,43 @@ def test_enable_mcp_tools_wires_the_gate(monkeypatch, _fresh_registry):
         mcp_client.enable_mcp_tools(spec)
 
 
+def test_preconnect_gate_blocks_connecting_when_declared(monkeypatch, _fresh_registry):
+    """显式 `requires_llm: True` → 闸门在**连接前**判定，不去拉一个注定 exit(1) 的子进程。
+
+    这条是「服务端加了启动期体检」之后的必要配套：否则缺凭据时子进程先自杀，
+    客户端只能拿到一条协议层「连接失败」，我们的可执行报错永远说不出口。
+    """
+    from src.core.llm import MissingCredentialError
+    from src import mcp_client
+
+    _no_llm_credentials(monkeypatch)
+    fake = _FakeBridge(["generate_sql"])
+    monkeypatch.setattr(mcp_client, "get_bridge", lambda: fake)
+    spec = [{"name": "p2", "transport": "stdio", "command": "python", "args": [],
+             "requires_llm": True}]
+
+    with pytest.raises(MissingCredentialError):
+        mcp_client.enable_mcp_tools(spec)
+    assert fake.connected == [], "声明了 requires_llm 就该在连接前拦下"
+
+
+def test_preconnect_gate_passes_and_connects_when_credentials_present(monkeypatch, _fresh_registry):
+    """反向对照：凭据齐备时，前置闸门不得阻止连接与注册。"""
+    from src.core.config import settings
+    from src import mcp_client
+
+    monkeypatch.setattr(settings, "llm_provider", "deepseek")
+    monkeypatch.setattr(settings, "deepseek_api_key", "sk-present")
+    fake = _FakeBridge(["generate_sql", "weather_now"])
+    monkeypatch.setattr(mcp_client, "get_bridge", lambda: fake)
+    spec = [{"name": "p2", "transport": "stdio", "command": "python", "args": [],
+             "requires_llm": True}]
+
+    registered = mcp_client.enable_mcp_tools(spec)
+    assert fake.connected == ["p2"], "凭据齐备时必须真的连上"
+    assert registered == ["weather_now"]
+
+
 def test_enable_mcp_tools_skips_registration_when_degraded(monkeypatch, caplog, _fresh_registry):
     """非 strict 下：工具一个都不注册（返回空列表），并留下 WARNING。"""
     import logging
@@ -489,3 +594,125 @@ def test_enable_mcp_tools_registers_normally_when_credentials_present(monkeypatc
 
     # generate_sql 与原生同名 → 原生优先跳过；weather_now 是新名字 → 注册成功
     assert registered == ["weather_now"]
+
+
+# ---------------- ⑧ 启动期验收：把 mcp_server.py 当**黑盒进程**验 ----------------
+#
+# 立场：这组断言的是**外部契约**，不是内部实现。
+#   · 「抛了 MissingCredentialError」是实现细节——哪天换成 sys.exit(2) 或别的异常，
+#     只要退出码非零 + 人话文案不变，客户端体验就没变；
+#   · 「进程非零退出 + stderr 里点名变量」才是契约：客户端/部署脚本真正能看到的东西。
+#
+# 同理 stdout 纪律也在这个层面验：stdio 模式下 stdout 是协议信道，一个字节都不能脏。
+# 手工起进程、手写 JSON-RPC 帧（不借 SDK），逐行断言全是合法协议帧——
+# 借 SDK 验会被 SDK 自己容错掉，看不到脏字节。
+
+_FRAMES = [
+    {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+     "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                "clientInfo": {"name": "pytest", "version": "0"}}},
+    {"jsonrpc": "2.0", "method": "notifications/initialized"},
+    {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+]
+
+
+def _env_without_credentials(provider: str = "deepseek") -> dict:
+    """故意让子进程「既没 .env 也没环境变量」里能用的凭据。
+
+    做法是把两家 key 都设为**空串**：pydantic-settings 的优先级是
+    进程环境 > `.env` 文件，所以空串会覆盖 `.env` 里的真实值（已实测）。
+    比「删掉变量」可靠——删掉后子进程会退回读 `.env`，测的就不是缺失场景了。
+    """
+    env = dict(os.environ)
+    env["DEEPSEEK_API_KEY"] = ""
+    env["AGNES_API_KEY"] = ""
+    env["LLM_PROVIDER"] = provider
+    return env
+
+
+def _env_with_placeholder_credentials(provider: str = "deepseek") -> dict:
+    """只求「体检过得了」的环境：给一个假 key。
+
+    启动期体检判的是**非空**，不是**有效**（有效性要到真调用才验证），所以假 key 足以
+    把进程带到「健康启动」态。用它而不是继承真实环境，是为了让这条用例
+    **不依赖跑测试的人的 shell**：有真 key 时结论一样，没有真 key 时也不该 skip。
+    """
+    env = dict(os.environ)
+    field = "DEEPSEEK_API_KEY" if provider == "deepseek" else "AGNES_API_KEY"
+    env["LLM_PROVIDER"] = provider
+    env[field] = "sk-PLACEHOLDER-FOR-STARTUP-ONLY"
+    other = "AGNES_API_KEY" if provider == "deepseek" else "DEEPSEEK_API_KEY"
+    env[other] = ""
+    return env
+
+
+def _run_server_raw(args=(), env=None, timeout: int = 90) -> subprocess.CompletedProcess:
+    """起真子进程、喂完整握手 3 帧、关 stdin 让它自己退出，回收 stdout/stderr/退出码。"""
+    payload = b"".join(json.dumps(f, ensure_ascii=False).encode() + b"\n" for f in _FRAMES)
+    return subprocess.run([sys.executable, str(SERVER), *args],
+                          input=payload, capture_output=True, env=env, timeout=timeout)
+
+
+def _tool_names(proc: subprocess.CompletedProcess) -> list[str]:
+    """从 stdout 里取 tools/list 的响应（id=2）→ 工具名列表。"""
+    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+        if not line.strip():
+            continue
+        obj = json.loads(line)                 # 脏字节会在这里直接炸，正是我们要的
+        if obj.get("id") == 2:
+            return [t["name"] for t in obj["result"]["tools"]]
+    raise AssertionError("stdout 里没有 tools/list 的响应")
+
+
+def test_server_exits_nonzero_and_names_the_variable_when_credentials_missing():
+    """★ 契约：缺凭据 → 非零退出 + stderr 点名变量 + 给修法；不该「装作启动成功」。"""
+    proc = _run_server_raw(env=_env_without_credentials())
+
+    assert proc.returncode != 0, "缺凭据必须以非零码退出，否则部署脚本会以为起来了"
+    # 顺序有意为之：最具体的诊断放前面，红了就能一眼归因。
+    # 「stdout 有字节」这个缺陷（诊断误打到协议信道）只有它抓得住，
+    # 若排在 stderr 断言之后，就会被「变量名不在 stderr」先遮蔽掉（断言会互相遮蔽）。
+    assert proc.stdout.strip() == b"", \
+        f"失败路径不许在 stdout 留字节（那是协议信道）：{proc.stdout[:200]!r}"
+    err = proc.stderr.decode("utf-8", "replace")
+    assert "DEEPSEEK_API_KEY" in err, f"stderr 必须点名到具体变量，实际：{err[:300]}"
+    assert ".env" in err, "还要告诉人去哪儿配（这是「能一步修好」的最低要求）"
+
+
+def test_stdio_stdout_is_protocol_only_when_healthy():
+    """★ stdout 洁净性：健康启动时 stdout **逐行**都必须是合法 JSON-RPC 帧。
+
+    这条是 stdio 传输的命门——任何一句 print 混进 stdout，客户端都会解析失败/断连。
+    所以诊断一律 stderr（`_startup_credential_check` 里全部 print(file=sys.stderr)）。
+    """
+    proc = _run_server_raw(env=_env_with_placeholder_credentials())
+
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")[:400]
+    raw = proc.stdout.decode("utf-8", "replace")
+    lines = [l for l in raw.splitlines() if l.strip()]
+    assert lines, "stdout 一个帧都没有，说明服务根本没应答"
+    for i, line in enumerate(lines):
+        obj = json.loads(line)                   # 非 JSON 直接失败，无需额外断言
+        assert obj.get("jsonrpc") == "2.0", f"第 {i} 行不是 JSON-RPC 帧：{line[:120]}"
+        assert set(obj) <= {"jsonrpc", "id", "result", "error", "method", "params"}, \
+            f"第 {i} 行不是协议帧：{line[:120]}"
+    # 集合断言而非顺序断言：工具顺序不是契约的一部分（条件注册使 generate_sql 排到了最后）
+    assert sorted(_tool_names(proc)) == sorted(["generate_sql", "execute_readonly_sql",
+                                                "compute_metric", "render_chart"]), \
+        "健康启动应暴露全部 4 个工具"
+
+
+def test_allow_degraded_starts_with_only_three_tools_and_warns():
+    """`--allow-degraded`：进程照常起来，但 **generate_sql 不出现在 tools/list 里**。
+
+    这是「不暴露工具」唯一合法的用法：显式声明降级，且 stderr 留了声音。
+    """
+    proc = _run_server_raw(args=("--allow-degraded",), env=_env_without_credentials())
+
+    assert proc.returncode == 0, "降级模式必须能正常起来，否则 --allow-degraded 没意义"
+    names = _tool_names(proc)
+    assert "generate_sql" not in names, "缺凭据时不该把用不了的工具暴露给客户端"
+    assert sorted(names) == sorted(["execute_readonly_sql", "compute_metric", "render_chart"]), \
+        f"其余 3 个工具必须照常在（它们不需要 LLM），实际：{names}"
+    err = proc.stderr.decode("utf-8", "replace")
+    assert "WARN" in err and "DEEPSEEK_API_KEY" in err, f"降级必须留声，实际：{err[:300]}"

@@ -270,10 +270,15 @@ def enable_mcp_tools(server_specs: list[dict], *, strict: bool = True) -> list[s
 
     返回实际注册的工具名列表（与原生四工具同名的会被跳过——原生优先）。
 
-    **凭据体检（本版新增）**：`list_tools` 本身不调 LLM，所以凭据缺失时连接与
-    注册都会成功，失败是**惰性**的——要等第一次真正调 `generate_sql` 才炸，
-    还会被上层兜成 degraded。于是这里在**注册前**补一道闸：若该 server 的工具集
-    里含依赖 LLM 的工具，而当前 provider 的凭据没配好，就当场处理。
+    **凭据体检**：`list_tools` 本身不调 LLM，所以凭据缺失时连接与注册都会成功，失败是
+    **惰性**的——要等第一次真正调 `generate_sql` 才炸，还会被上层兜成 degraded。
+    于是这里补一道闸，分两个时机：
+
+      · **连接前**：spec 显式写 `"requires_llm": True` 时即可判定。**连本仓库的
+        `mcp_server.py` 请务必写上这一项**——它自己带启动期体检，缺凭据会 `sys.exit(1)`，
+        客户端只会拿到一条协议层「连接失败」，闸门根本来不及说话。
+      · **连接后**：未声明时按**工具集**自动判定（只有 `generate_sql` 建 LLM 客户端），
+        这样第三方天气/日历 server 不会因为「我们自己没配 LLM key」被误拦。
 
     strict=True（默认）：抛 `MissingCredentialError`，把部署错误暴露在**启动时**。
     strict=False：打 WARNING 并**跳过该 server 的工具注册**（模型看不到这些工具）。
@@ -283,6 +288,12 @@ def enable_mcp_tools(server_specs: list[dict], *, strict: bool = True) -> list[s
     registered: list[str] = []
     for spec in server_specs:
         name = spec["name"]
+        declared = spec.get("requires_llm")     # True / False / None(=按工具集自动判定)
+        # ① **连接前**闸：显式声明 requires_llm=True 时才能提前判定（那时拿不到工具集）。
+        #    这一步在 server 带启动期体检后变成必需——否则缺凭据时子进程直接 exit(1)，
+        #    客户端只会拿到一条协议层「连接失败」，看不出是凭据问题。
+        if declared is True and not _gate_llm_credentials(name, True, strict):
+            continue
         if spec["transport"] == "stdio":
             bridge.connect_stdio(name, spec["command"], spec.get("args") or [],
                                  spec.get("env"))
@@ -291,7 +302,9 @@ def enable_mcp_tools(server_specs: list[dict], *, strict: bool = True) -> list[s
         else:
             raise ValueError(f"未知 MCP transport: {spec['transport']}")
         tools = bridge.list_tools(name)
-        if not _gate_llm_credentials(name, _needs_llm_credentials(spec, tools), strict):
+        # ② **连接后**闸：未显式声明时按工具集自动判定，判定为「不需要」就不拦。
+        if declared is None and not _gate_llm_credentials(
+                name, _needs_llm_credentials(spec, tools), strict):
             continue          # 显式降级：已打 WARNING，该 server 的工具一个都不注册
         for tool in tools:
             disp = (lambda sn, tn: lambda args: bridge.call(sn, tn, args))(name, tool.name)

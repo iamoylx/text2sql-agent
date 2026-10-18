@@ -20,7 +20,7 @@
 | 2 | supervisor「token 更低」这一优势 | 视为普惠结论 | **未复现**（DeepSeek 上成本反 **+62%**） | 模型行为不同：supervisor 每次修订的上下文都在变，缓存命中率 **62.8%**，远低于 agentic 的 **84.0%** | 同上；「何时选谁」的推荐口径 |
 | 3 | S5 端到端（DeepSeek） | 0.7593（41/54） | **0.7963**（43/54） | `empty_result` 判据从「查关键词」改为「结果集语义比对」，纠正 2 条**答对却被判错**的用例 | S5 章节、README 指标表 |
 | 4 | S8 supervisor 正确率（DeepSeek） | 0.875（7/8） | **1.000（8/8）** | 原 7/8 的唯一失败 b5 是 AGNES 免费额度 429，换不限流提供方后不再发生 | S8 章节、README 指标表 |
-| 5 | 测试总数 | 81 passed + **2 skipped** | **125 passed / 0 skipped** | 新增 24 条成本计量单测 + MCP 子进程凭据用例 3→7 条（净 +4）+ 凭据失败形态 11 条；那 2 条真 LLM 用例现可跑（不再因额度跳过）。注：换 DeepSeek 当次 110 → 任务 A 后 114 → 失败形态补齐后 125 | README 测试小节 |
+| 5 | 测试总数 | 81 passed + **2 skipped** | **131 passed / 0 skipped** | 新增 24 条成本计量单测 + MCP 子进程凭据用例 3→7 条（净 +4）+ 凭据失败形态与启动期验收 17 条；那 2 条真 LLM 用例现可跑（不再因额度跳过）。注：换 DeepSeek 当次 110 → 114 → 125 → 131 | README 测试小节 |
 | 6 | MCP 子进程凭据取值源 | `os.environ` | **`settings`** | 只读 `os.environ` 会漏掉**只写在 `.env` 里**的值（AGNES 时代靠子进程自己读 CWD 的 `.env` 兜底才没出事） | `src/mcp_client.py`、README MCP 章节 |
 
 **判定规则（防再次踩坑）**：
@@ -409,9 +409,91 @@ CWD 的 `.env` 兜底（同一处兜底掩盖了同一个缺陷两次）。改�
 > 也会通过——**通过的可能是量级巧合，不是设计正确**。给两个来源喂**不同的值**，
 > 才能把「从哪儿取」这件事变成一个可判定的可观测量。
 
-回归计数（2026-10-18 重跑）：`pytest tests/test_mcp.py` → **27 passed（含真实 LLM 用例，不再 skip）**；
-全量 `RUN_SLOW=1 pytest tests/` → **125 passed / 0 skipped**（换 DeepSeek 当次为 110；
-本段 7 条替掉旧的 3 条净 +4 → 114，第 ⑦ 段 11 条 → 125），零回归。
+回归计数（2026-10-18 重跑）：`pytest tests/test_mcp.py` → **33 passed（含真实 LLM 用例，不再 skip）**；
+全量 `RUN_SLOW=1 pytest tests/` → **131 passed / 0 skipped**（换 DeepSeek 当次为 110；
+7 条替掉旧的 3 条净 +4 → 114，第 ⑦ 段 11 条 → 125，⑧ 段与连接前判定 → 131），零回归。
+
+### 服务端启动期体检 + 黑盒进程验收（2026-10-18 第二轮）
+
+上一轮把「客户端闸门 + 调用期结构化错误」补齐了，但**服务端自己仍然会「带病启动」**：
+`python src/mcp_server.py` 在没凭据时也照常起来，把 4 个工具都报给客户端。本轮补上第三道：
+
+| 层 | 位置 | 缺凭据时 | 前提 |
+|---|---|---|---|
+| ① **服务端启动**（新） | `mcp_server.py::_startup_credential_check`，在 `mcp.run()` 之前 | 默认：stderr 打「变量 + 三步修法」后 `sys.exit(1)`；`--allow-degraded`：stderr WARN，**不注册 generate_sql**，其余 3 个照常 | 只依赖 settings，不依赖客户端 |
+| ② **客户端闸门** | `mcp_client.enable_mcp_tools` | 连接**前**（`requires_llm: True`）或连接**后**（按工具集）判定 | 需要先能连上 |
+| ③ **调用期** | `registry._tool_generate_sql` | `error_code=MISSING_CREDENTIALS` + `retryable=False` | 走到调用才触发 |
+
+**为什么加了 ① 就必须给 ② 补「连接前」判定**（本轮最值得记的时序耦合）：
+① 硬失败之后，缺凭据时子进程**直接 exit(1)**，客户端连 `list_tools` 都走不到 ——
+② 里那道「连接后闸门」永远没机会说话，客户端只会收到一条协议层的「连接失败」。
+**把失败提前，会改变上游组件的失败路径**：每提前一层，就要检查上面那一层还够不够得着。
+故 `enable_mcp_tools` 现在支持 `spec["requires_llm"]=True` 时**连接前**判定；
+连本仓库自己的 server 请务必写上这一项。
+
+**stdout 纪律**：stdio 模式下 stdout 是**协议信道**，脏一个字节客户端就断连。
+所有诊断（含启动失败的文案）一律 `print(..., file=sys.stderr)`。
+验证方式：**手写 JSON-RPC 帧、直接起进程、逐行 `json.loads`**——不借 SDK，
+因为 SDK 自己会容错掉脏字节，用它验等于没验。
+
+**stderr 也要干净**（顺手）：FastMCP 自己的 Settings 有个未解析前向引用（`lifespan`），
+每次起服务都会往 stderr 吐一条 `IncompleteFieldDefinitionWarning`，正好把「缺凭据」的
+部署报错挤到后面。只在入口处**按类别**过滤这一条（其余 pydantic_settings 警告照旧输出）。
+现在无凭据启动的 stderr 全文就是那 5 行修法，没有别的东西。
+
+**新增 6 条用例**（`tests/test_mcp.py`，第 ⑦ 段 2 条 + 第 ⑧ 段 3 条 + 纯函数 1 条）：
+
+| 用例 | 断言的是哪一层 |
+|---|---|
+| `test_server_exits_nonzero_and_names_the_variable_when_credentials_missing` | ★**外部契约**：非零退出 + stderr 点名变量 + 给出 `.env` + stdout 必须为空 |
+| `test_stdio_stdout_is_protocol_only_when_healthy` | ★stdout 洁净：逐行都是合法 JSON-RPC 帧，且 4 个工具齐全 |
+| `test_allow_degraded_starts_with_only_three_tools_and_warns` | 降级模式能起、只报 3 个工具、stderr 有 WARN |
+| `test_preconnect_gate_blocks_connecting_when_declared` | 声明 `requires_llm` 时闸门在**连接前**（假桥 `connected == []`） |
+| `test_preconnect_gate_passes_and_connects_when_credentials_present` | 反向对照：凭据齐备时不得阻止连接 |
+| `test_judge_generate_sql_distinguishes_two_kinds_of_red` | **同一条报错，凭据在不在 → 一个红一个 skip**（见下） |
+
+**为什么断言「退出码 + 人话文案」而不是「抛了某异常」**：后者是实现细节——
+哪天换成 `sys.exit(2)`、或改成别的异常类型，只要退出码非零且文案不变，客户端体验就没变。
+**能被外部观察到的东西才是契约**，其余都是可以自由重构的内部结构。
+
+#### Task B：把「两种红」从环境判断里救出来
+
+原用例靠 `os.environ.get("AGNES_API_KEY")` 之类判断要不要 skip，**红绿取决于跑测试的人的 shell**。
+改成读 `settings`（部署配置唯一入口，已合并 `.env` 与进程环境），并加 `llm.has_llm_credentials()` 作为
+「只判断不抛」的入口，规则是：**凭据不在 → skip；凭据在却仍报缺 → 必须红**（那是传参层 bug）。
+
+诚实的边界：加了 ① 之后，「凭据在却报缺」对自家 server **已经不可达**（子进程启动即退），
+所以把它埋在那个需要真实 LLM 的用例里等于永远没人验。于是把判定抽成纯函数
+`_judge_generate_sql(out, credentials_present=...)`，用 4 组输入（结构化错误 / SDK 原话 /
+429 / 正常）把规则钉死，真 LLM 用例只负责拿回 `out` 再交给它判。
+
+#### 顺带修掉的「安全启动误伤测试」
+
+① 硬失败之后，**没有凭据的机器上整个 `test_mcp.py` 都会 error**（夹具拉不起 server），
+连那些压根不需要 LLM 的用例（安全拦截、回环查询）也一起挂。修法：夹具在
+`has_llm_credentials()` 为假时用 `--allow-degraded` 起——新加的 flag 正好用来隔离
+「部署没配」与「代码坏了」两种情形。两种场景实测：
+
+| 场景 | 结果 |
+|---|---|
+| 有凭据 | `pytest tests/test_mcp.py` → **33 passed** |
+| 无凭据（`DEEPSEEK_API_KEY= AGNES_API_KEY=`） | **32 passed, 1 skipped** —— 恰好只有真 LLM 那条 skip |
+
+**变异验证（三条，各只改一件事，均已回滚）**：
+
+| 变异 | 实测 |
+|---|---|
+| M7：`__main__` 里跳过 `_startup_credential_check`（无条件注册 generate_sql） | **2 红**（非零退出 + 降级三工具） |
+| M8：硬失败文案改成 `print(str(exc))`（打到 stdout） | **1 红**，且红在 **stdout 断言**上 |
+| M9：`_MCP_ENV_FROM_SETTINGS` 漏掉 `DEEPSEEK_API_KEY` | **fixture 阶段 ERROR**（红），**绝不 skip** —— 白名单 bug 不会被「环境没配」吞掉 |
+
+> M8 第一次跑时红在 **stderr 断言**上，而不是 stdout 断言——因为我把 `stdout 为空` 写在了
+> stderr 断言之后，被「变量名不在 stderr」抢先报了。这正是「断言会互相遮蔽」的老问题：
+> **最具体的诊断要放在最前面**，否则红了也归不了因。调整顺序后 M8 精确红在 stdout 那条。
+
+> M9 的形态值得记：白名单漏项现在表现为**夹具阶段 ERROR**（子进程启动即 exit 1），
+> 而不是干净的 assert 失败。噪声大了些，但方向是对的——**任何凭据传递 bug 都是红，
+> 不存在「因为环境没配所以跳过」的逃逸通道**。
 
 ### 追问：运行者既没 `.env` 也没环境变量时，这个 MCP 工具该怎么优雅失败？
 
@@ -565,7 +647,7 @@ judge，每例 4-8 次连发）必触免费档突发限额。**运维洞察：�
 | 其余 81 例 | 全离线（FakeLLM / 本地算力），评测卫生保持干净 | 81 passed |
 
 > 上表是 **AGNES 时代的历史快照**（当时那两条只能 skip）。换 DeepSeek 后两条均真跑，
-> 当前计数见文首「数字变更记录」第 5 行（**125 passed / 0 skipped**）。
+> 当前计数见文首「数字变更记录」第 5 行（**131 passed / 0 skipped**）。
 
 > 原文写「唯一真实 LLM 消费点」不准确，已订正。同时修掉一个**评测假象**：
 > 该 MCP 用例原先只处理「网关返回 429（错误在 dict 的 `error` 字段里）」这一种失败形态，

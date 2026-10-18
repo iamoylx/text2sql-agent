@@ -57,8 +57,8 @@ system prompt，保证人人问出一致口径。
 | 写路径安全用例 | 18/18 | S9 HITL：三道闸 8 + dry-run 零副作用 3 + commit/审计 2 + CSV 导入 5 |
 | Supervisor 离线用例 | 5/5 | S8：FakeLLM 驱动全图（happy path / 判官打回循环 / 安全降级 / 规划纠偏） |
 | CTE 白名单用例 | 4/4 | S8 连带修复：WITH 别名不被误杀、不掩盖真越权表 |
-| MCP 协议用例 | **27/27** | S7：stdio/http 双传输回环 + 安全不旁路 + 第三方工具动态注册 + **子进程凭据白名单 7 条** + **凭据失败形态 11 条（含接线与反向对照）**（含真实 LLM 用例，不再 skip） |
-| 服务层测试 | pytest **125 passed，0 skipped** | 工具双保险 + 安全层 + S9 写路径 + S8 Supervisor + S7 MCP + 场景包 + 成本计量；**换 DeepSeek 后原本"因额度跳过"的 2 条真实 LLM 用例也真的跑起来了**（AGNES 时代长期 81 passed + 2 skipped） |
+| MCP 协议用例 | **33/33** | S7：stdio/http 双传输回环 + 安全不旁路 + 第三方工具动态注册 + **子进程凭据白名单 7 条** + **凭据失败形态 11 条（含接线与反向对照）** + **启动期黑盒验收 3 条**（含真实 LLM 用例，不再 skip） |
+| 服务层测试 | pytest **131 passed，0 skipped** | 工具双保险 + 安全层 + S9 写路径 + S8 Supervisor + S7 MCP + 场景包 + 成本计量；**换 DeepSeek 后原本"因额度跳过"的 2 条真实 LLM 用例也真的跑起来了**（AGNES 时代长期 81 passed + 2 skipped） |
 
 评测卫生：金标集与 few-shot 库严格错题；金标口径与 system prompt 一致（踩过 3 个评测设计坑）。
 性能账本（真实计时/计费，详见 METRICS.md）：S5 全量延迟 mean 44.3s / median 37.0s / p95 101s，
@@ -90,12 +90,23 @@ S5 端到端 **460s vs AGNES 约 2658s（快 5.8×）**、三个评测合计 **�
   compute_metric / render_chart 四个工具按 MCP 暴露，实现层复用 `src/tools/registry`
   同一份代码（不是绕过安全的副本）。支持 stdio 与 streamable-http 双传输：
   `python src/mcp_server.py --http 8600`
+- **Server 启动期体检**：`mcp.run()` 之前先 `require_llm_credentials()`。
+  缺凭据默认**硬失败**（stderr 点名变量 + 三步修法 → `exit 1`），
+  `--allow-degraded` 则只打 WARN 并**不注册 generate_sql**（其余 3 个工具不需要 LLM，照常可用）。
+  ★ stdio 模式下 **stdout 是协议信道**，所有诊断一律走 stderr——有测试逐行断言 stdout 全是合法 JSON-RPC 帧。
 - **Client**（`src/mcp_client.py`）：后台事件循环 + AsyncExitStack 保活连接；
   任何 MCP server 一行接入：
   ```python
   from src.mcp_client import enable_mcp_tools
   enable_mcp_tools([{"name": "ext", "transport": "http", "url": "http://127.0.0.1:8610/mcp"}])
   # 发现 → inputSchema 动态转 Pydantic → register_external_tool → Agent 下一轮可见
+
+  # 接本仓库自己的 server 时请显式声明 requires_llm：
+  # 它带启动期体检，缺凭据会 exit(1)，客户端闸门必须抢在**连接前**判定，否则只能拿到
+  # 一条协议层「连接失败」，看不出是凭据问题
+  enable_mcp_tools([{"name": "p2", "transport": "stdio",
+                     "command": sys.executable, "args": ["src/mcp_server.py"],
+                     "requires_llm": True}])
   ```
 - 经 MCP 调 `DROP TABLE` / 查白名单外表**照样被四层安全拦截**；
   与原生同名的第三方工具被跳过（原生优先），新工具经 Pydantic 校验通道 dispatch（无旁路）。
@@ -123,18 +134,21 @@ token、第三方 key）一并塞进一个我们并未逐行审计过的子进�
 用**冲突值**做决定性断言：`os.environ` 与 `settings` 给不同的 key，子进程必须拿到 settings 那份）。
 两次变异验证非空转——回退成读 `os.environ` → 4 红；白名单里塞一个不存在的字段名 → 字段存在性检查当场报错。
 
-**凭据缺失怎么失败：启动期 fail-fast，调用期结构化错误**
+**凭据缺失怎么失败：三道防线，越早越好**
 
-`list_tools` 本身不调 LLM，所以凭据缺失时**连接与注册都会成功**，失败是**惰性**的——
+`list_tools` 本身不调 LLM，所以凭据缺失时**连接与注册都会成功**，失败曾经是**惰性**的——
 等第一次真正调 `generate_sql` 才炸，还被上层兜成 `degraded`。用户看到的是「Agent 好像不太会
-写 SQL」，而不是「你少配了一个变量」。现状修成两层：
+写 SQL」，而不是「你少配了一个变量」。现在修成三层：
 
-- **启动期**：`enable_mcp_tools(...)` 在注册前过一道闸——该 server 的工具集里含 `generate_sql`
-  （或 spec 显式声明 `"requires_llm": true`）而当前 provider 的 key 为空时，抛
-  `MissingCredentialError`，文案写清「缺哪个变量 / 写 `.env` 还是 `setx` / 怎么验证」。
-  传 `strict=False` 则改为**打 WARNING 并跳过该 server 的工具注册**——这是「不暴露工具」
-  唯一合法的用法：显式降级、且留了声音。
-- **调用期**：`_tool_generate_sql` 把 SDK 原话（`openai.OpenAIError: Missing credentials.
+- **① 服务端启动期**（`src/mcp_server.py`）：`mcp.run()` 之前先 `require_llm_credentials()`，
+  缺凭据默认 `exit(1)`（stderr 写「缺哪个变量 / 写 `.env` 还是 `setx` / 怎么验证」），
+  `--allow-degraded` 则 WARN + 不注册 `generate_sql`。这一层连客户端都不需要存在。
+- **② 客户端闸门**（`enable_mcp_tools`）：看情况分两个时机——
+  `spec["requires_llm"]=True` 时**连接前**判定（否则子进程先 `exit(1)`，我们连 `list_tools` 都走不到，
+  只能等到一条协议层「连接失败」）；未声明则**连接后**按工具集自动判定。
+  默认 `strict=True` 抛 `MissingCredentialError`；`strict=False` 改为**打 WARNING 并跳过该 server 的
+  工具注册**——这是「不暴露工具」唯一合法的用法：显式降级、且留了声音。
+- **③ 调用期**（`_tool_generate_sql`）：把 SDK 原话（`openai.OpenAIError: Missing credentials.
   Please pass an api_key … or set OPENAI_API_KEY`）翻译成
   `{"ok": false, "error_code": "MISSING_CREDENTIALS", "retryable": false, "error": "缺少 LLM 凭据：…DEEPSEEK_API_KEY…"}`。
   两个理由：**SDK 指向的 `OPENAI_API_KEY` 我们根本不用**，报错必须点名真实变量；
@@ -142,8 +156,10 @@ token、第三方 key）一并塞进一个我们并未逐行审计过的子进�
 
 判据按**工具集**而不是按 server 名：`execute_readonly_sql` / `compute_metric` / `render_chart`
 都不建 LLM 客户端，只有 `generate_sql` 会——否则第三方天气/日历 server 会因为**我们自己没配
-LLM key** 被误拦。这条边界有 11 条零 LLM 用例 + 4 次变异验证守着（去掉结构化错误 → 1 红；闸门失效 → 2 红；
-判定一律「需要凭据」→ 2 红；**删掉主流程里的闸门调用 → 2 红而 9 条叶子用例全绿**）。
+LLM key** 被误拦。这条边界有 17 条零 LLM 用例 + 7 次变异验证守着（去掉结构化错误 → 1 红；闸门失效 → 2 红；
+判定一律「需要凭据」→ 2 红；删掉主流程里的闸门调用 → 2 红而 9 条叶子用例全绿；
+跳过启动期体检 → 2 红；失败文案打到 stdout → 1 红；白名单漏项 → 夹具阶段红，绝不 skip）。
+另有两场景实测：有凭据 33 passed；无凭据 32 passed / 1 skipped（只有真 LLM 那条跳过）。
 
 ## 业务外壳可插拔：场景包（Scenario Pack）
 

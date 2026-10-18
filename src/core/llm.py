@@ -70,6 +70,22 @@ def require_llm_credentials() -> None:
         )
 
 
+def has_llm_credentials() -> bool:
+    """只判断、不抛：当前 provider 的凭据是否就位（供测试/运维脚本区分失败原因）。
+
+    存在的意义是把「环境没配」和「配置没传进去」区分开：
+      · False → 这条用例的前置条件不成立，应 skip，而不是报红；
+      · True 但下游仍报缺凭据 → **必是传参层 bug**（白名单漏项、子进程环境没给），必须红。
+    映射表与 `require_llm_credentials()` 共用同一份，避免「两处各写一遍、总有一天不同步」。
+    """
+    provider = (settings.llm_provider or "").strip().lower()
+    pair = _PROVIDER_CREDENTIAL.get(provider)
+    if pair is None:
+        return False
+    field, _env_name = pair
+    return bool(str(getattr(settings, field, "") or "").strip())
+
+
 def _deepseek_extra_body() -> dict:
     """DeepSeek 思考模式开关（OpenAI 格式要求放在 extra_body 里）。
 
