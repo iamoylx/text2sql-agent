@@ -57,8 +57,8 @@ system prompt，保证人人问出一致口径。
 | 写路径安全用例 | 18/18 | S9 HITL：三道闸 8 + dry-run 零副作用 3 + commit/审计 2 + CSV 导入 5 |
 | Supervisor 离线用例 | 5/5 | S8：FakeLLM 驱动全图（happy path / 判官打回循环 / 安全降级 / 规划纠偏） |
 | CTE 白名单用例 | 4/4 | S8 连带修复：WITH 别名不被误杀、不掩盖真越权表 |
-| MCP 协议用例 | **12/12** | S7：stdio/http 双传输回环 + 安全不旁路 + 第三方工具动态注册 + **子进程凭据白名单 3 条** |
-| 服务层测试 | pytest **110 passed，0 skipped** | 工具双保险 + 安全层 + S9 写路径 + S8 Supervisor + S7 MCP + 场景包 + 成本计量；**换 DeepSeek 后原本"因额度跳过"的 2 条真实 LLM 用例也真的跑起来了**（AGNES 时代长期 81 passed + 2 skipped） |
+| MCP 协议用例 | **16/16** | S7：stdio/http 双传输回环 + 安全不旁路 + 第三方工具动态注册 + **子进程凭据白名单 7 条**（含真实 LLM 用例，不再 skip） |
+| 服务层测试 | pytest **114 passed，0 skipped** | 工具双保险 + 安全层 + S9 写路径 + S8 Supervisor + S7 MCP + 场景包 + 成本计量；**换 DeepSeek 后原本"因额度跳过"的 2 条真实 LLM 用例也真的跑起来了**（AGNES 时代长期 81 passed + 2 skipped） |
 
 评测卫生：金标集与 few-shot 库严格错题；金标口径与 system prompt 一致（踩过 3 个评测设计坑）。
 性能账本（真实计时/计费，详见 METRICS.md）：S5 全量延迟 mean 44.3s / median 37.0s / p95 101s，
@@ -100,7 +100,7 @@ S5 端到端 **460s vs AGNES 约 2658s（快 5.8×）**、三个评测合计 **�
 - 经 MCP 调 `DROP TABLE` / 查白名单外表**照样被四层安全拦截**；
   与原生同名的第三方工具被跳过（原生优先），新工具经 Pydantic 校验通道 dispatch（无旁路）。
 
-**子进程凭据：不做全量环境透传，走显式白名单**（`src/mcp_client.py::_MCP_ENV_PASSTHROUGH`）
+**子进程凭据：不做全量环境透传，走显式白名单，且**取值源是 `Settings`**（`src/mcp_client.py::_MCP_ENV_FROM_SETTINGS`）
 
 stdio 子进程的环境**不是**父进程 `os.environ` 的复制——MCP SDK 只透传
 `get_default_environment()` 的白名单（本机实测仅 12 个变量：`PATH` / `APPDATA` / `TEMP` /
@@ -110,8 +110,18 @@ stdio 子进程的环境**不是**父进程 `os.environ` 的复制——MCP SDK 
 修法刻意**不做 `**os.environ` 全量透传**：那等于把父进程所有密钥（数据库口令、云厂商
 token、第三方 key）一并塞进一个我们并未逐行审计过的子进程，是用「修好了」换「泄露面无限大」。
 正确姿势是**显式白名单**——子进程要自建 LLM 与只读连库，就只给它这两类凭据；写库口令
-`agent_rw` 刻意不在名单内。`tests/test_mcp.py` 有 3 条**零 LLM 消耗**的用例钉住这条边界
-（且已做变异验证：还原成「只返回 SDK 基线」时断言必红，非空转）。
+`agent_rw` 刻意不在名单内。
+
+白名单的值**一律从 `Settings` 读，不从 `os.environ` 读**：pydantic-settings 会把 `.env`
+与进程环境合并，只读 `os.environ` 会漏掉**只写在 `.env` 里**的配置（此前 AGNES 能跑纯属
+子进程自己也读了 CWD 的 `.env` 兜底——同一处兜底把同一个缺陷掩盖了两次）。改从 settings 取
+还顺带得到两点：子进程**不再依赖 CWD 能找到 `.env`**（从任意目录起 `mcp_server.py` 都能跑）；
+配置来源唯一，测试可直接 `monkeypatch` 伪造 settings 字段，**不必改真实环境变量**，
+红绿不再取决于跑测试的机器。
+
+`tests/test_mcp.py` 有 **7 条零 LLM 消耗**的用例钉住这条边界（其中`test_child_env_takes_value_from_settings_not_environ`
+用**冲突值**做决定性断言：`os.environ` 与 `settings` 给不同的 key，子进程必须拿到 settings 那份）。
+两次变异验证非空转——回退成读 `os.environ` → 4 红；白名单里塞一个不存在的字段名 → 字段存在性检查当场报错。
 
 ## 业务外壳可插拔：场景包（Scenario Pack）
 

@@ -182,44 +182,105 @@ def test_mcp_to_openai_schema_shape():
 # 之前 AGNES 能跑只是巧合：子进程的 settings 会读 CWD 的 .env，而 .env 正好有
 # AGNES_API_KEY 兜底；换成 deepseek 后 .env 里没有对应项，兜底失效才暴露出来。
 #
-# 这组用例不连 LLM、不花钱，专防「换 provider 又静默漏凭据」。
+# ★ 本组用例**不依赖运行环境**：全部用 monkeypatch 伪造 settings 字段来驱动，
+#   不读真实 os.environ / .env。这样无论谁在哪台机器上跑，结论都一致
+#   （旧写法靠 `os.environ.get(...)` 判断后再 skip，属于「红绿取决于机器」的测试）。
 
-def test_child_env_inherits_provider_key():
-    """当前 provider 的密钥必须出现在子进程环境里（否则子进程建 LLM 必失败）。"""
-    import os
+def test_child_env_takes_value_from_settings_not_environ(monkeypatch):
+    """★ 核心用例：同时给环境变量和 settings 一个**不同的**值，子进程必须拿到 settings 的。
 
+    这是「取值源是 settings 而不是 os.environ」唯一的决定性证据——
+    只断言「值等于 settings」还不够（两者恰好相同时它也会通过），
+    必须让两个来源冲突，才能证明读的是哪一个。
+    """
     from src.core.config import settings
     from src.mcp_client import _child_env
 
-    env = _child_env()
-    provider = settings.llm_provider
-    key_name = f"{provider.upper()}_API_KEY"
-    if not os.environ.get(key_name):
-        pytest.skip(f"父进程本就没有 {key_name}（本机未配置），无法验证透传")
-    assert env.get(key_name) == os.environ[key_name], (
-        f"子进程环境缺少 {key_name} —— MCP stdio 默认白名单不透传密钥，"
-        f"需加入 _MCP_ENV_PASSTHROUGH")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-FROM-ENV")
+    monkeypatch.setattr(settings, "deepseek_api_key", "sk-FROM-SETTINGS")
+
+    assert _child_env()["DEEPSEEK_API_KEY"] == "sk-FROM-SETTINGS"
 
 
-def test_child_env_keeps_safe_baseline_and_no_secret_smuggling():
-    """白名单不是全量透传：安全基线（PATH 等）要在，非白名单密钥不进。
-    这是「修好功能」与「不放大泄露面」之间的边界断言。
-    """
-    import os
-
-    from src.mcp_client import _child_env, _MCP_ENV_PASSTHROUGH
-
-    env = _child_env()
-    assert env.get("PATH"), "PATH 必须有，否则子进程起不来"          # SDK 基线仍在
-    assert "TAVILY_API_KEY" not in env, "非白名单密钥不得进子进程"     # 刻意的边界
-    assert "TAVILY_API_KEY" not in _MCP_ENV_PASSTHROUGH, "白名单本身也不该收编无关密钥"
-    # 写口令不能进子进程：读路径的子进程没有写权限的必要
-    assert not any("RW" in k or "PASSWORD" in k.upper() for k in env), \
-        "子进程环境不得包含写库口令"
-
-
-def test_child_env_extra_overrides_whitelist():
-    """调用方 spec.env 可覆盖白名单同名项（如给某 server 换模型）。"""
+def test_child_env_passes_agnes_key_even_when_provider_is_deepseek(monkeypatch):
+    """两家的 key 都传：换 provider 只需改 LLM_PROVIDER，不必再动传参层。"""
+    from src.core.config import settings
     from src.mcp_client import _child_env
 
+    monkeypatch.setattr(settings, "agnes_api_key", "ag-from-settings")
+    monkeypatch.setattr(settings, "deepseek_api_key", "ds-from-settings")
+    env = _child_env()
+    assert env["AGNES_API_KEY"] == "ag-from-settings"
+    assert env["DEEPSEEK_API_KEY"] == "ds-from-settings"
+
+
+def test_child_env_omits_empty_settings_value(monkeypatch):
+    """settings 里是空串 → 该变量**不出现**，而不是传一个空串过去。
+
+    `AGNES_API_KEY=""` 与「没有这个变量」对子进程语义不同：前者会被当成
+    「配置了但为空」，后者才让它走自己的默认/报错路径。
+    """
+    from src.core.config import settings
+    from src.mcp_client import _child_env
+
+    monkeypatch.setattr(settings, "agnes_api_key", "")
+    monkeypatch.setattr(settings, "deepseek_api_key", "")
+    env = _child_env()
+    assert "AGNES_API_KEY" not in env
+    assert "DEEPSEEK_API_KEY" not in env
+
+
+def test_child_env_non_secret_configurable_values_are_forwarded(monkeypatch):
+    """非机密的行为参数也要传：否则父子进程默认值不同 → 同一问题两条通道生成的 SQL 不同。"""
+    from src.core.config import settings
+    from src.mcp_client import _child_env
+
+    monkeypatch.setattr(settings, "llm_max_tokens", 777)
+    monkeypatch.setattr(settings, "llm_temperature", 0.5)
+    env = _child_env()
+    assert env["LLM_MAX_TOKENS"] == "777"      # int → 环境变量必须是 str
+    assert env["LLM_TEMPERATURE"] == "0.5"
+
+
+def test_whitelist_fields_all_exist_on_settings():
+    """白名单里的每个字段名必须真的存在于 Settings 上。
+
+    ★ 这条不是形式主义：`_child_env` 用 `getattr(settings, field, None)` 取值，
+    **字段名写错会静默退化成「不传」**——于是又回到「子进程缺凭据」那个原始故障，
+    而且不报任何错。这条用例就是给静默失败装上报警器。
+    """
+    from src.core.config import Settings
+    from src.mcp_client import _MCP_ENV_FROM_SETTINGS
+
+    fields = set(Settings.model_fields)
+    unknown = sorted(f for f in _MCP_ENV_FROM_SETTINGS.values() if f not in fields)
+    assert not unknown, f"白名单引用了 Settings 上不存在的字段：{unknown}"
+
+
+def test_child_env_keeps_safe_baseline_and_no_secret_smuggling(monkeypatch):
+    """边界断言：安全基线（PATH）要在，非白名单密钥不进，写库口令不进。
+
+    这是「修好功能」与「不放大泄露面」之间的分界线——
+    全量透传也能让功能工作，但那等于把父进程所有密钥交给子进程。
+    """
+    from src.mcp_client import _MCP_ENV_FROM_SETTINGS, _child_env
+
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-should-not-leak")
+    env = _child_env()
+    assert env.get("PATH"), "PATH 必须有，否则子进程起不来"        # SDK 基线仍在
+    assert "TAVILY_API_KEY" not in env, "非白名单密钥不得进子进程"
+    assert "TAVILY_API_KEY" not in _MCP_ENV_FROM_SETTINGS, "白名单本身也不该收编无关密钥"
+    assert "SCENARIO" not in _MCP_ENV_FROM_SETTINGS, "SCENARIO 无 settings 字段且无人消费，属死配置"
+    # 写库口令不能进子进程：读路径的子进程没有写权限的必要。
+    # 检查的是**值**而不只是键名——DB_URL 里若嵌了 agent_rw 的口令，键名是看不出来的。
+    leaked = [k for k, v in env.items() if "agent_rw" in str(v)]
+    assert not leaked, f"子进程环境里出现了写库凭据：{leaked}"
+
+
+def test_child_env_extra_overrides_whitelist(monkeypatch):
+    """调用方 spec.env 可覆盖白名单同名项（如只给某个 server 换模型）。"""
+    from src.core.config import settings
+    from src.mcp_client import _child_env
+
+    monkeypatch.setattr(settings, "llm_model", "from-settings")
     assert _child_env({"LLM_MODEL": "x-probe"}).get("LLM_MODEL") == "x-probe"

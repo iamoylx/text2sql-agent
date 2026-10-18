@@ -61,7 +61,14 @@ def s8_cost() -> dict:
         }
     t_a = out["agentic"]["tokens_per_case"]["mean"]
     t_s = out["supervisor"]["tokens_per_case"]["mean"]
-    out["token_delta"] = f"supervisor vs agentic: {(t_s - t_a) / t_a:+.0%} /例"
+    # ★ 口径警示（2026-10-16 订正）：本节的 token 全部取自**图内 state.token_cost**，
+    #   而它对 agentic 少算约 31.4%（bind_tools 暴露的 generate_sql 工具内部又调一次 LLM，
+    #   嵌套用量未入 state）。所以这里的差额**只能同图内口径自比，不可作为跨编排结论引用**。
+    #   同口径（API 实测）结论见 METRICS.md 的「数字变更记录」。
+    out["token_delta"] = (
+        f"[旧口径·不可作结论] supervisor vs agentic: {(t_s - t_a) / t_a:+.0%} /例"
+        f"（图内记账；agentic 侧少算约 31%，同口径实测为 -9.8%，见 METRICS.md「数字变更记录」）"
+    )
     return out
 
 

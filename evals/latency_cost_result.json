@@ -122,6 +122,6 @@
         "max": 8
       }
     },
-    "token_delta": "supervisor vs agentic: -49% /例"
+    "token_delta": "[旧口径·不可作结论] supervisor vs agentic: -49% /例（图内记账；agentic 侧少算约 31%，同口径实测为 -9.8%，见 METRICS.md「数字变更记录」）"
   }
 }

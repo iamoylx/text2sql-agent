@@ -5,6 +5,28 @@
 > `evals/run_s4_behavior.py`（S4 行为）/ `evals/run_eval_s5.py`（S5，60 条全量）/
 > `evals/run_selfheal_eval.py`（S5 自愈专项）
 > 数据：Olist 巴西电商公开数据集 9 表 10 万订单（SQLite dev 库 `data/db/olist.db`）
+>
+> ★ **引用本文件（或简历/话术/学习手册）里的任何数字前，先查下面的「数字变更记录」。**
+
+## 数字变更记录（口径订正）
+
+**为什么要这张表**：指标口径一变，旧数字不会自己失效——它继续躺在文档、简历、面试话术里
+被当真。本表把「哪个数是旧口径、哪个是新口径、为什么变」钉死，让后来的人（和未来的我）
+不会再把旧数字当结论引用。
+
+| # | 指标 | 旧口径值 | **新口径值（以此为准）** | 为什么变 | 影响面 |
+|---|---|---|---|---|---|
+| 1 | S8 supervisor 相对 agentic 的 token 差额 | −56%（全量汇总）/ −49%（单例） | **−9.8%** | 旧值取自**图内 `state.token_cost`**，而它对 agentic **少算 31.4%**（`bind_tools` 暴露的 `generate_sql` 工具内部又调一次 LLM，嵌套用量未入 `state`）。新值改读 API usage（`CostTracker`），两图同口径 | S8 章节表格、延迟与成本章节、README 编排对照 |
+| 2 | supervisor「token 更低」这一优势 | 视为普惠结论 | **未复现**（DeepSeek 上成本反 **+62%**） | 模型行为不同：supervisor 每次修订的上下文都在变，缓存命中率 **62.8%**，远低于 agentic 的 **84.0%** | 同上；「何时选谁」的推荐口径 |
+| 3 | S5 端到端（DeepSeek） | 0.7593（41/54） | **0.7963**（43/54） | `empty_result` 判据从「查关键词」改为「结果集语义比对」，纠正 2 条**答对却被判错**的用例 | S5 章节、README 指标表 |
+| 4 | S8 supervisor 正确率（DeepSeek） | 0.875（7/8） | **1.000（8/8）** | 原 7/8 的唯一失败 b5 是 AGNES 免费额度 429，换不限流提供方后不再发生 | S8 章节、README 指标表 |
+| 5 | 测试总数 | 81 passed + **2 skipped** | **114 passed / 0 skipped** | 新增 24 条成本计量单测 + MCP 子进程凭据用例 3→7 条（净 +4）；那 2 条真 LLM 用例现可跑（不再因额度跳过）。注：换 DeepSeek 当次为 110，任务 A 增测后为 114 | README 测试小节 |
+| 6 | MCP 子进程凭据取值源 | `os.environ` | **`settings`** | 只读 `os.environ` 会漏掉**只写在 `.env` 里**的值（AGNES 时代靠子进程自己读 CWD 的 `.env` 兜底才没出事） | `src/mcp_client.py`、README MCP 章节 |
+
+**判定规则（防再次踩坑）**：
+① 凡是「跨编排 / 跨模型 / 跨版本」的差额，**必须确认两侧是同一种计量口径**，否则只能各自陈述、不能相减；
+② 凡是靠**措辞**做的判断（关键词命中、措辞比对），迟早会被下一个模型打穿，应换成**语义判据**；
+③ 口径一变，**旧值要在原处标记为作废或不可比**，不能只在文末补一句。
 
 ## 数据入库（P2-S1，2026-09-07）
 
@@ -261,7 +283,7 @@ Function 节点，原表名提取只认 Identifier → **INSERT 的表白名单�
 |---|---|---|
 | 行为正确率 | **8/8 = 1.000** | **7/8 = 0.875**（唯一失败 b5 是 AGNES 免费额度 429，非设计缺陷） |
 | LLM 调用数 | 29 | 32（规划+判官的额外开销） |
-| token | 78,579 | **34,888（-56%）**——黑板隔离让每个子 Agent 上下文极小 |
+| token（**旧口径·图内记账**） | 78,579 | 34,888 —— 两侧口径不一致，**不可相减**；同口径结论见「数字变更记录」 |
 | 端到端延迟 | 293.6s | 828.1s（串行分工 + 判官轮次，诚实展示代价） |
 
 质量门控两层：① Python 硬门控（黑板产出完整性）② LLM-as-Judge 软门控（数字溯源/口径合规/
@@ -332,33 +354,101 @@ PROCESSOR_ARCHITECTURE SYSTEMDRIVE SYSTEMROOT TEMP USERNAME USERPROFILE
 `.env` 无对应项，兜底断了才浮出水面。**这是「换掉一个看似无关的依赖，暴露了被兜底掩盖的
 真实缺陷」的典型例子**，也说明「之前能跑」不能当作「设计正确」的证据。
 
-**修法：显式白名单，不做 `**os.environ` 全量透传**
+**修法：显式白名单 + 取值源改为 settings（不是 `os.environ`）**
 
 ```python
-_MCP_ENV_PASSTHROUGH = (
-    "DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_THINKING",
-    "AGNES_API_KEY", "AGNES_BASE_URL", "LLM_PROVIDER", "LLM_MODEL",
-    "DB_URL", "DB_RO_URI", "SCENARIO",
-)   # ★ 写库口令 agent_rw 刻意不在名单内
+# 配置名 → settings 字段；取值走 pydantic-settings（.env 文件 + 进程环境变量合并后的结果）
+_MCP_ENV_FROM_SETTINGS = {
+    "LLM_PROVIDER": "llm_provider",   "LLM_MODEL": "llm_model",
+    "DEEPSEEK_API_KEY": "deepseek_api_key", "DEEPSEEK_BASE_URL": "deepseek_base_url",
+    "DEEPSEEK_THINKING": "deepseek_thinking",
+    "AGNES_API_KEY": "agnes_api_key", "AGNES_BASE_URL": "agnes_base_url",
+    "AGNES_MODEL": "agnes_model",
+    "LLM_TEMPERATURE": "llm_temperature", "LLM_MAX_TOKENS": "llm_max_tokens",
+    "LLM_TIMEOUT": "llm_timeout",
+    "DB_URL": "db_url", "DB_RO_URI": "db_ro_uri",
+}   # ★ 写库口令 agent_rw 刻意不在名单内；SCENARIO 已移除（settings 无此字段、无人消费）
 ```
 
 全量透传会把父进程所有密钥（DB 口令、云 token、第三方 key）塞进一个我们并未逐行审计过的
 子进程——那是用「修好功能」换「泄露面无限大」。白名单让子进程恰好拿到「自建 LLM + 只读连库」
 所需，其余不给。
 
-**回归防线（零 LLM 消耗）**：`tests/test_mcp.py` 新增 3 条
+**为什么取值源必须是 settings 而不是 `os.environ`（2026-10-18 修正）**：
+只读 `os.environ` 会漏掉**只写在 `.env` 里**的值——AGNES 时代能跑，纯靠子进程自己也读了
+CWD 的 `.env` 兜底（同一处兜底掩盖了同一个缺陷两次）。改从 settings 取还顺带得到：
+① 子进程**不再依赖 CWD 能找到 `.env`**（从任意目录启动 `mcp_server.py` 都能跑）；
+② 配置来源唯一，测试可直接 monkeypatch 伪造 settings 字段，**不必修改真实环境变量**
+——测试因此从「红绿取决于机器」变成确定性。
+
+**回归防线（零 LLM 消耗）：`tests/test_mcp.py` 第 ⑥ 段 7 条，全部不依赖真实环境变量**
+
+全部用 `monkeypatch` 伪造 `Settings` 字段与 `os.environ`，因此**红绿与跑测试的机器无关**。
 
 | 用例 | 钉住的性质 |
 |---|---|
-| `test_child_env_inherits_provider_key` | 当前 provider 的密钥必须在子进程环境里 |
-| `test_child_env_keeps_safe_baseline_and_no_secret_smuggling` | `PATH` 等基线仍在，且 `TAVILY_API_KEY` 等**非白名单密钥不得进**、环境里不得有写库口令 |
+| `test_child_env_takes_value_from_settings_not_environ` | ★**决定性**：`os.environ` 与 `settings` 给**冲突值**时，子进程必须拿到 settings 的那份 |
+| `test_child_env_passes_agnes_key_even_when_provider_is_deepseek` | 两个 provider 的密钥都要传（切 provider 后回切不必重开进程） |
+| `test_child_env_omits_empty_settings_value` | settings 值为空串时该键**整体不出现**，而不是塞一个 `""` |
+| `test_child_env_non_secret_configurable_values_are_forwarded` | 非密参数（温度/上限/超时）也要传，且正确 `int→str` |
+| `test_whitelist_fields_all_exist_on_settings` | 白名单里的每个字段名都真实存在（挡 `getattr(..., None)` 静默吞掉错拼字段名） |
+| `test_child_env_keeps_safe_baseline_and_no_secret_smuggling` | `PATH` 等基线仍在；`TAVILY_API_KEY` 等**非白名单密钥不得进**；值里不得出现写库口令 |
 | `test_child_env_extra_overrides_whitelist` | 调用方 `spec.env` 可覆盖白名单同名项 |
 
-**变异验证（防空气测试）**：把 `_child_env()` 换成「修复前」行为（只返回 SDK 基线白名单）
-跑同一套断言 → **FAIL**；修复后 → **PASS**。非空转。
+**变异验证（防空气测试，两次都只改一件事）**：
 
-全量回归：**pytest 76 passed + 1 skipped 零回归** → 换 DeepSeek 后
-`pytest tests/test_mcp.py` **12 passed（含真实 LLM 用例，不再 skip）**。
+| 变异 | 预期 | 实测 |
+|---|---|---|
+| M1：`_child_env()` 回退成「从 `os.environ` 取」（即修复前行为） | 决定性那条必须红 | **4 条红**，含 `test_child_env_takes_value_from_settings_not_environ` |
+| M2：往白名单塞一个 `Settings` 上不存在的字段 `llm_model_typo_xxx` | 字段存在性检查必须红 | **1 条红**，报 `白名单引用了 Settings 上不存在的字段：['llm_model_typo_xxx']` |
+
+两次变异均已回滚，`grep` 校验 **0 处残留**。
+
+> **为什么「决定性断言」必须是冲突值**：如果只断言「子进程环境里的 key 等于 settings 的 key」，
+> 那么当 `os.environ` 与 `settings` 恰好相同时（真实机器上通常如此），读 `os.environ` 的旧实现
+> 也会通过——**通过的可能是量级巧合，不是设计正确**。给两个来源喂**不同的值**，
+> 才能把「从哪儿取」这件事变成一个可判定的可观测量。
+
+回归计数（2026-10-18 重跑）：`pytest tests/test_mcp.py` → **16 passed（含真实 LLM 用例，不再 skip）**；
+全量 `RUN_SLOW=1 pytest tests/` → **114 passed / 0 skipped**（换 DeepSeek 当次为 110，
+本段用 7 条替掉旧的 3 条，净 +4），零回归。
+
+### 追问：运行者既没 `.env` 也没环境变量时，这个 MCP 工具该怎么优雅失败？
+
+**先说现状（比"优雅失败"更糟）**：`enable_mcp_tools()` → `connect_stdio` → `list_tools`
+**全程不调用 LLM**，所以凭据缺失时**连接照样成功、四个工具照样注册**。失败是**惰性**的——
+要等到第一次真正调 `generate_sql`，`get_llm()` 才抛 `OpenAIError: Missing credentials`，
+再被 `answer_agentic` 的 `except Exception` 兜成 `degraded`。用户看到的是
+「**Agent 好像不太会写 SQL**」，而不是「**你少配了一个变量**」。这是三种失败方式里最差的一种：
+**不报错、报错也报错在错的地方、话术还不是我们自己的**。
+
+**立场：报「缺凭据」，但不要靠「不暴露工具」来解决。** 三条理由：
+
+1. **暴露工具属于「能力」层，凭据属于「部署」层，耦合会让 schema 随环境漂移。**
+   工具集一旦随环境变化，同一批评测用例在 A 机器能跑、B 机器不能——这与本项目
+   「评测必须可比、换模型必须 `--tag`」的纪律直接冲突。工具集应当是**确定的**。
+2. **静默隐藏就是静默失败。** 用户拿到的现象是「模型不用 SQL 工具」，需要反查四层
+   才能想到是 key 没配。可观测性上，**没有日志的自动降级等于制造谜题**。
+3. **模型会读 ToolMessage 做决策。** 把 SDK 原话 `Missing credentials` 喂回去，
+   它很可能解读成「这个工具坏了，换一个试试」→ 白烧步数；缺凭据的 `capability`
+   不是「换工具」，而是「这个部署缺配置」。
+
+**该怎么做（两层，缺一不可）**：
+
+| 层 | 做法 | 为什么 |
+|---|---|---|
+| **启动期：fail-fast，且点名到变量** | `enable_mcp_tools()` 连接前按当前 `llm_provider` 检查对应 key 非空；缺失则抛 `MissingCredentialError`，消息里写清「缺哪个变量、`.env` 还是环境变量、怎么验证」 | 部署错误必须在**部署时刻**暴露，不是在使用时刻。报错文案要能让人**一步修好** |
+| **调用期：把 SDK 话术翻译成结构化错误** | `_tool_generate_sql` 里给 `get_llm()` 加保护，返回 `{"ok": false, "error_code": "MISSING_CREDENTIALS", "retryable": false, "error": "缺少 LLM 凭据：DEEPSEEK_API_KEY 未配置"}` | ToolMessage 是**喂给模型**的。`retryable: false` 明确告诉它别重试，`error_code` 给上层做路由分支 |
+
+**「不暴露工具」只在一种情况下正确**：作为**显式降级开关**（`strict=False`），用于 CI /
+纯离线单测——此时跳过该 server **并且打一条 WARNING**。区别在于：这是
+「**我知道我在降级，并且留下了声音**」，而不是「悄悄少给模型几个工具」。
+
+一句话：**默认 fail-fast 报缺凭据；「不暴露」只能当显式开关，且必须带日志。**
+
+> 状态：本节是设计答复，**代码尚未落地**（当前实现就是上面描述的「惰性失败」）。
+> 落地点已定位：`src/mcp_client.py::enable_mcp_tools`（启动期）+
+> `src/tools/registry.py::_tool_generate_sql`（调用期）。
 
 
 ## 延迟与成本统计（S8 复盘扩展，2026-09-09）✅
@@ -378,22 +468,21 @@ _MCP_ENV_PASSTHROUGH = (
 量化结论：**自愈的延迟代价 = 一次通过的 +25%**（50.9 vs 40.7s）——重试一轮 LLM 生成 +
 校验的线性成本，换来的是 21 条本会失败的查询被救回（自愈成功率 0.708），
 
-**S8 双跑单例成本（成功例口径，与全量汇总 -56% 的差异在于失败例不计入分母）**：
+**S8 双跑单例成本（成功例口径）**——下方 token 一律是**旧口径「图内记账」**，两侧口径不一致、
+**不可跨编排相减**，详见「数字变更记录」：
 
-| 编排 | tokens/例 | latency/例 | llm_calls/例 |
+| 编排 | tokens/例（旧口径） | latency/例 | llm_calls/例 |
 |---|---|---|---|
 | agentic | mean 9,822 / median 6,794 | 36.7s | 3.6 |
-| supervisor | mean 4,984 / median 4,300（**-49%**） | 58.3s（+59%） | 4.6 |
+| supervisor | mean 4,984 / median 4,300 | 58.3s（+59%） | 4.6 |
 
-一句话成本模型：**supervisor 用 +59% 延迟换 -49% token**——规划与判官多一轮调用（调用数
-3.6→4.6）拉长串行时延，但黑板隔离把每个子 Agent 的上下文砍半。何时选谁：token 贵/上下文
-敏感选 supervisor，延迟敏感选 agentic。
+只有「**延迟 +59%**」这一侧是可靠的。订正后的成本模型：**supervisor 延迟 +56%、成本 +62%**；
+「token 更低」在同口径下仅 **−9.8%**，且在 DeepSeek 上未复现（缓存命中率 62.8% vs 84.0%）。
 
-> ⚠️ **本节结论已被 2026-10-16 的交叉验证订正，请以上方「真实 LLM 端到端」章节为准。**
+> ⚠️ **本节 token 结论已作废（2026-10-16 交叉验证订正），请以「数字变更记录」为准。**
 > 本节 token 数取自图内 `state.token_cost`；用 CostTracker 直接读 API usage 互校后发现
-> **agentic 侧少算 31.4%**（嵌套工具调用未入账，详见该章「S8 交叉验证暴露的计量不一致」）。
-> 同口径重算的差额是 **−9.8%**（而非 −49%/−56%），且在 DeepSeek 上未复现该优势。
-> 保留本节原文以记录「单一计量口径自证不了自己」这个过程。
+> **agentic 侧少算 31.4%**（嵌套工具调用未入账，详见「真实 LLM 端到端」章节的
+> 「S8 交叉验证暴露的计量不一致」）。保留本节原文以记录「单一计量口径自证不了自己」这个过程。
 
 
 ## S8-b5 补跑结论 + S7 LLM 端到端验证（2026-09-09）✅
@@ -405,7 +494,9 @@ AGNES 免费额度恢复后对历史欠账定向补测：
 调用可过（探针成功、MCP 单例用例成功），但 supervisor 的多轮串行调用（planner→sql_agent→
 judge，每例 4-8 次连发）必触免费档突发限额。**运维洞察：免费额度部署下，supervisor 的
 「规划-分工-裁决」结构比单 Agent 循环更容易撞限流**——降级路径（degraded + 如实说明）
-是正确的兜底姿态。保留 S8 结论：7/8（唯一失败 b5=429），token -56%，延迟 +2.8x。
+是正确的兜底姿态。S8 按**订正后口径**记录：行为 7/8（唯一失败 b5=429，属额度绑定）、
+延迟 +2.8×；token 侧旧口径为 −56%，同口径（API 实测）重算为 **−9.8%** 且在 DeepSeek 上未复现
+——口径变更来由见「数字变更记录」。（注：DeepSeek 复跑已补齐 supervisor 8/8，见文末章节。）
 
 **S7 LLM 端到端——已验证**：`test_mcp_generate_sql_returns_sql` 冷却后单跑 PASSED
 （24.5s）：经 MCP 通道真实调用 AGNES，generate_sql 返回合法 SELECT——「第三方经 MCP
@@ -418,6 +509,9 @@ judge，每例 4-8 次连发）必触免费档突发限额。**运维洞察：�
 | `tests/test_mcp.py::test_mcp_generate_sql_returns_sql` | **自动跳过**：429/限流 → skip；排队超时（>120s）→ skip | SKIPPED（429） |
 | `tests/test_tools.py::(真实 LLM 用例)` | **主动门控**：需 `RUN_SLOW=1` 才跑，默认跳过以免烧 token | SKIPPED（未设 RUN_SLOW） |
 | 其余 81 例 | 全离线（FakeLLM / 本地算力），评测卫生保持干净 | 81 passed |
+
+> 上表是 **AGNES 时代的历史快照**（当时那两条只能 skip）。换 DeepSeek 后两条均真跑，
+> 当前计数见文首「数字变更记录」第 5 行（**114 passed / 0 skipped**）。
 
 > 原文写「唯一真实 LLM 消费点」不准确，已订正。同时修掉一个**评测假象**：
 > 该 MCP 用例原先只处理「网关返回 429（错误在 dict 的 `error` 字段里）」这一种失败形态，

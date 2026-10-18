@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import threading
 from typing import Any
 
@@ -37,27 +36,60 @@ from src.tools.registry import register_external_tool
 #
 # 修法刻意**不做 `**os.environ` 全量透传**：那会把父进程里所有密钥（数据库口令、
 # 云厂商 token、第三方 API key）一并塞进一个我们并未审计过全部代码的子进程，
-# 等于用一个「修好了」换一个「泄露面无限大」。正确姿势是显式白名单——
-# 子进程要自建 LLM 与只读连库，就只给它这两类凭据。
-_MCP_ENV_PASSTHROUGH = (
-    # LLM 凭据与选型（子进程 mcp_server.py 复用同一套 get_llm）
-    "DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_THINKING",
-    "AGNES_API_KEY", "AGNES_BASE_URL",
-    "LLM_PROVIDER", "LLM_MODEL",
-    # 数据源与场景（只读连接串；写口令 agent_rw 刻意**不在**白名单内）
-    "DB_URL", "DB_RO_URI", "SCENARIO",
-)
+# 等于用一个「修好了」换一个「泄露面无限大」。正确姿势是显式白名单。
+#
+# ★ 取值源是 **settings 而不是 os.environ**（本版修正）：
+#   settings 由 pydantic-settings 合并「.env 文件 + 进程环境变量」得到，是项目唯一
+#   配置入口。只读 os.environ 会漏掉**只写在 .env 里**的值——AGNES 时代能跑纯属巧合
+#   （子进程自己也读了 CWD 的 .env 兜底），换个 provider 就露馅。
+#   改从 settings 取之后还顺带得到两个性质：
+#     ① 子进程**不再依赖 CWD 能找到 .env**（从任意目录启动 mcp_server.py 都能跑）；
+#     ② 配置来源唯一，测试可以用 monkeypatch 直接伪造 settings 字段，
+#        不必去改真实环境变量（见 tests/test_mcp.py 的「不依赖环境的用例」）。
+#
+# 收录判据：子进程启动后为「复现父进程的 LLM 与数据访问」所必需。
+#   · 评测资产路径（goldset/fewshots）不在其中——那不是运行时必需；
+#   · 写库口令 agent_rw 不在其中——子进程只做只读查询；
+#   · SCENARIO 已移除：settings 里没有该字段、get_profile() 目前也忽略它，
+#     留在白名单里只会让人误以为「换场景已经接线」。
+_MCP_ENV_FROM_SETTINGS: dict[str, str] = {
+    # —— LLM 选型与凭据（AGNES_API_KEY / DEEPSEEK_API_KEY 是唯一的机密字段）——
+    "LLM_PROVIDER": "llm_provider",
+    "LLM_MODEL": "llm_model",
+    "DEEPSEEK_API_KEY": "deepseek_api_key",
+    "DEEPSEEK_BASE_URL": "deepseek_base_url",
+    "DEEPSEEK_THINKING": "deepseek_thinking",
+    "AGNES_API_KEY": "agnes_api_key",
+    "AGNES_BASE_URL": "agnes_base_url",
+    "AGNES_MODEL": "agnes_model",
+    # —— LLM 行为参数 ——
+    # 不传的话子进程会用它自己那份默认值：父进程若调过 LLM_MAX_TOKENS，
+    # 同一个问题在 MCP 通道与原生通道会生成不同 SQL——这类不一致极难排查。
+    "LLM_TEMPERATURE": "llm_temperature",
+    "LLM_MAX_TOKENS": "llm_max_tokens",
+    "LLM_TIMEOUT": "llm_timeout",
+    # —— 数据源（只读连接串）——
+    "DB_URL": "db_url",
+    "DB_RO_URI": "db_ro_uri",
+}
 
 
 def _child_env(extra: dict | None = None) -> dict[str, str]:
-    """构造 stdio 子进程环境：SDK 安全基线 + 显式白名单 + 调用方覆盖。"""
+    """构造 stdio 子进程环境：SDK 安全基线 + 白名单（取自 settings）+ 调用方覆盖。
+
+    空值不传：未配置的项留空让子进程自己走默认值，避免把一个空字符串塞进环境
+    反而覆盖掉子进程的默认（`AGNES_API_KEY=""` 与「没有这个变量」语义不同）。
+    """
     from mcp.client.stdio import get_default_environment
 
+    from src.core.config import settings
+
     env = dict(get_default_environment())
-    for key in _MCP_ENV_PASSTHROUGH:
-        value = os.environ.get(key)
-        if value:
-            env[key] = value
+    for env_name, field in _MCP_ENV_FROM_SETTINGS.items():
+        value = getattr(settings, field, None)
+        if value is None or str(value) == "":
+            continue
+        env[env_name] = str(value)
     if extra:
         env.update({k: str(v) for k, v in extra.items()})
     return env
@@ -106,7 +138,7 @@ class MCPToolBridge:
         from mcp.client.stdio import stdio_client
 
         # 必须显式给 env：SDK 在 server.env 为 None 时只透传安全白名单，
-        # 子进程读不到 LLM 凭据（见 _MCP_ENV_PASSTHROUGH 上方注释）
+        # 子进程读不到 LLM 凭据（见 _MCP_ENV_FROM_SETTINGS 上方注释）
         params = StdioServerParameters(command=command, args=args,
                                        env=_child_env(env))
         # 常驻连接：AsyncExitStack 持住全部上下文——若不持有 CM 对象引用，
