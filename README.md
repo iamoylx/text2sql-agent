@@ -209,28 +209,99 @@ FastAPI /api/query (SSE)                     ┌──────────�
 
 ## 快速开始
 
+> **需要准备两样外部资源**：① Olist 数据集（9 个 CSV，约 150 MB）；② 一个 LLM API Key。
+> 两者都不在仓库里（数据涉版权、key 涉安全），下面给**可直接复制执行**的步骤。
+
+### 1. 装依赖
+
 ```bash
-# 1. 环境（Python 3.12）
-python -m venv .venv && .venv/Scripts/activate    # Windows
+python -m venv .venv
+.venv\Scripts\activate                 # Windows；Linux/macOS: source .venv/bin/activate
 pip install -r requirements.txt
-
-# 2. 数据入库（Olist 公开数据集 9 表）
-python scripts/init_db.py
-#    建库后会自动刷新 data/schema.md（给人读的 Schema 文档，随仓库提交）
-#    单独刷新文档（不重建库）：python scripts/init_db.py --dump-schema
-
-# 3. 配置 LLM（.env）
-#    AGNES_API_KEY=...   （或 DEEPSEEK_API_KEY，config 留有备用位）
-
-# 4. 起 API 服务（8501）
-python scripts/run_api.py
-# 打开 http://127.0.0.1:8501
-
-# 5. 跑评测
-python evals/run_eval_s5.py          # 60 条全量
-python evals/run_selfheal_eval.py    # 自愈专项
-python -m pytest -q                  # 单测
 ```
+
+### 2. 下载 Olist 数据集 → 解压到 `data/raw/`
+
+数据集：**[Brazilian E-Commerce Public Dataset by Olist](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce)**
+（Kaggle 免费，需登录账号，下载后得到 `archive.zip`）。
+
+解压后把内层 9 个 CSV 放到 `data/raw/`（文件名必须完全一致）：
+
+```
+data/raw/
+├── olist_customers_dataset.csv
+├── olist_geolocation_dataset.csv          # 或放原 zip 也行，init_db.py 会自动解压
+├── olist_order_items_dataset.csv
+├── olist_order_payments_dataset.csv
+├── olist_order_reviews_dataset.csv
+├── olist_orders_dataset.csv
+├── olist_products_dataset.csv
+├── olist_sellers_dataset.csv
+└── product_category_name_translation.csv
+```
+
+> 官方 `olist_geolocation_dataset.csv` 有 100 万行 / 58 MB，是最大的一个。
+> **9 个 CSV 必须放全**——`init_db.py` 逐表 `read_csv`，缺任何一个都会在那一张表上
+> 直接 `FileNotFoundError` 中断（不会静默跳过）。
+
+### 3. 建库
+
+```bash
+python scripts/init_db.py
+# 建完自动刷新 data/schema.md（给人读的 Schema 文档，随仓库提交）
+# 只刷新文档不重建库：python scripts/init_db.py --dump-schema
+```
+
+导入 9 表共约 155 万行，**首次约 15 秒**（实测 13.3s）。脚本会逐表打印行数并与官方口径校验
+（对不上会打 ⚠️ 而不是静默通过）。产出 `data/db/olist.db`（约 130 MB，已 gitignore）。
+
+### 4. 配 LLM（`.env`）
+
+```bash
+cp .env.example .env
+```
+
+```ini
+# DeepSeek（本项目实测用的就是它）
+LLM_PROVIDER=deepseek
+DEEPSEEK_API_KEY=sk-...
+LLM_MODEL=deepseek-flash
+
+# 或 Agnes 免费额度：LLM_PROVIDER=agnes / AGNES_API_KEY=...
+```
+
+> 数据库默认落 SQLite（`data/db/olist.db`），零配置。切 MySQL 只改 `DB_URL` 一行，
+> 见 `.env.example` 里的说明（生产形态用 `agent_ro` 只读账号）。
+
+### 5. 起服务
+
+```bash
+python scripts/run_api.py          # http://127.0.0.1:8501
+```
+
+三栏界面：左 Schema 树 / 中对话（SQL 可折叠、反馈）/ 右结果表 + ECharts。
+试一句：**「2017年各品类销量 Top5，用图表展示」**。
+
+### 6. 自检（不耗 LLM 额度）
+
+```bash
+python -m pytest -q                # 默认 131 passed / 2 skipped，任何机器一致
+python evals/run_eval_s5.py        # 60 条全量评测（需 LLM，约 ¥0.18）
+python evals/run_selfheal_eval.py  # 自愈专项（需 LLM，约 ¥0.04）
+```
+
+> 为什么会有 2 个 skip：只有两条用例真调 LLM，由 `RUN_SLOW=1` 显式控制。
+> 默认口径下整套测试**零外部依赖**（不联网、不读凭据、不需准备数据），
+> 所以「131 passed / 2 skipped」在任何机器上都能复现。
+
+### 常见卡点
+
+| 现象 | 原因 / 处理 |
+|---|---|
+| `FileNotFoundError: data/raw/olist_orders_dataset.csv` | 第 2 步没做或文件名不对 |
+| 启动报「未读取到 DEEPSEEK_API_KEY」 | `.env` 没配或 `LLM_PROVIDER` 拼错；报错文案会点名变量 |
+| 行数校验出现 ⚠️ | 数据集版本不同或 CSV 被截断，对照官方行数核对 |
+| 429 / 限流 | 免费额度常见；换 DeepSeek 或降低并发 |
 
 ## 代码导读（推荐阅读顺序）
 
