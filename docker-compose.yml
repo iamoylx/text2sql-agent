@@ -94,7 +94,13 @@ services:
     image: mysql:8.4
     profiles: ["mysql"]
     environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PWD:?需要先设置 MYSQL_ROOT_PWD}
+      # 刻意**不用** `${MYSQL_ROOT_PWD:?...}`：compose 会先对整个文件做变量插值，
+      # **再**按 profile 过滤服务。也就是说即使 mysql 处于未激活的 profile，
+      # 缺这个变量也会让 `docker compose up`（乃至 down）直接报
+      # "required variable MYSQL_ROOT_PWD is missing a value" 而整体失败。
+      # 这条在 CI 首次跑时真实发生过——默认路径被一个「没启用的服务」拖死。
+      # 所以给一个本地开发用的弱密码兜底，生产必须显式覆盖。
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PWD:-dev_only_change_me}
       MYSQL_DATABASE: olist
       # 只读账号：四层安全的第①层（DB 授权仅 SELECT，写操作 1142 denied）
       MYSQL_USER: agent_ro
@@ -104,7 +110,11 @@ services:
     volumes:
       - mysql-data:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PWD}"]
+      # `$$` 是 compose 的转义：它渲染成字面 `$`，于是密码取自**容器自己的**
+      # 环境变量 MYSQL_ROOT_PASSWORD，而不是让 compose 在解析期用宿主机的
+      # ${MYSQL_ROOT_PWD} 插值——后者在没设该变量时会变成 `-p`（空），
+      # 与容器里实际的密码不一致，健康检查永远红。
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\""]
       interval: 10s
       timeout: 5s
       retries: 12

@@ -22,6 +22,7 @@ f-string 会在**导入期**求值 → `NameError: name 'schema' is not defined`
 1. 导入不炸（含不依赖凭据/DB/网络——LLM 是懒创建，导入期不该连外部）
 2. FastAPI app 与关键路由存在
 3. `{schema}` 占位符契约：模板里是字面量、能被 `.replace()` 填掉
+4. 数据目录不存在时也能起来（服务自己建目录，不指望部署脚本先准备好）
 
 零外部依赖，不需要 key / DB / 模型。
 """
@@ -73,3 +74,37 @@ def test_write_prompt_keeps_runtime_schema_placeholder():
 
     filled = prompt.replace("{schema}", "<SCHEMA_BLOCK>")
     assert "<SCHEMA_BLOCK>" in filled and "{schema}" not in filled
+
+
+def test_svc_db_creates_missing_parent_dir(tmp_path, monkeypatch):
+    """服务必须能自己创建它要写的数据目录。
+
+    起因（Docker 首次真跑时炸的）：`server.py` 在**导入期**就调用 `_svc_init()`
+    落 `data/db/service.db`。而 `sqlite3.connect()` 不会创建缺失的父目录，
+    只会抛 `OperationalError: unable to open database file`。
+
+    镜像里不带 `data/`（数据走卷挂载），容器首次启动时 `/app/data/db` 不存在
+    → `import src.api.server` 直接失败、服务根本起不来。
+    **本地永远复现不了**：本地 `data/db/` 早被 135 MB 的真实库占着了。
+
+    所以断言点不是「连得上库」，而是「在目录不存在时也能连上，并把目录建出来」。
+    """
+    import sqlite3
+
+    import src.api.server as server
+
+    target = tmp_path / "not" / "yet" / "there" / "service.db"
+    assert not target.parent.exists(), "前置条件：父目录一开始必须不存在"
+
+    monkeypatch.setattr(server, "_SVC_DB", target)
+    server._svc_init()
+
+    assert target.exists(), "没有建出 service.db"
+    con = sqlite3.connect(target)
+    try:
+        names = {r[0] for r in
+                 con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        con.close()
+    missing = {"history", "feedback", "proposals"} - names
+    assert not missing, f"建表不全，缺：{missing}"

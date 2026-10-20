@@ -62,6 +62,15 @@ _SVC_DB = Path(settings.db_path).parent / "service.db"
 
 
 def _svc_conn() -> sqlite3.Connection:
+    # 必须先建父目录：sqlite3.connect() **不会**自己创建缺失的目录，只会抛
+    # `sqlite3.OperationalError: unable to open database file`。
+    # 这个坑在 Docker 上真实炸过一次：镜像里不带 data/（数据走卷挂载），
+    # 容器首次启动时 /app/data/db 不存在 → `import src.api.server` 直接失败，
+    # 服务根本起不来。而本地永远复现不了（本地 data/db/ 早就有 135MB 的库）。
+    #
+    # 放在这里而不是只在 Dockerfile 里 mkdir：**服务应该能自己创建自己要写的数据目录**，
+    # 否则任何「干净机器首次部署」都得靠外部先准备好目录结构——那是部署脚本的责任泄漏。
+    _SVC_DB.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(_SVC_DB)
     con.row_factory = sqlite3.Row
     return con

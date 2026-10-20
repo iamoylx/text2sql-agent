@@ -73,6 +73,12 @@ COPY evals/ ./evals/
 ENV API_HOST=0.0.0.0 \
     API_PORT=8501
 
+# 预建 data/db：一是下面 VOLUME 声明的匿名卷会继承镜像里已有的目录结构
+# （空目录也继承），二是让「不挂卷直接 run」也能起来。
+# 注意这只是兜底——真正的修复在 src/api/server.py 的 _svc_conn()：
+# 服务必须能自己创建自己要写的数据目录，不该指望外部先准备好。
+RUN mkdir -p /app/data/db
+
 EXPOSE 8501
 
 # 数据卷挂载点：真实库、CSV、审计日志、自定义表注册都在这里
