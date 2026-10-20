@@ -456,6 +456,11 @@ def cmd_e2e(a) -> int:
     _warn_if_weak(own, len(records))
     if a.strict:
         _strict_check(records, items)
+        strict_foreign = strict_crosstalk(records, items)
+        print(f"[严格] 结果集交叉矩阵命中他人金标（串场）：{len(strict_foreign)} 处"
+              + (f"  -> {strict_foreign[:5]}" if strict_foreign else "  [OK] 0 串场"))
+        _report_power(records)
+        foreign = strict_foreign or foreign
     print(f"E 路径  -> {md_row('P2-E 全链路', len(records), a.conc, s, _guess_e(records))}")
     _save("E", a.tag, {"meta": _meta(a, url), "summary": s,
                        "statuses": statuses, "own_sql_hit": own,
@@ -481,6 +486,11 @@ def cmd_crosstalk(a) -> int:
     _warn_if_weak(own, len(records))
     if a.strict:
         _strict_check(records, items)
+        strict_foreign = strict_crosstalk(records, items)
+        print(f"[严格] 结果集交叉矩阵命中他人金标（串场）：{len(strict_foreign)} 处"
+              + (f"  -> {strict_foreign[:5]}" if strict_foreign else "  [OK] 0 串场"))
+        _report_power(records)
+        foreign = strict_foreign or foreign
     _save("crosstalk", a.tag, {"meta": _meta(a, url), "summary": s,
                                "own_sql_hit": own, "foreign_hits": foreign,
                                "records": records})
@@ -558,6 +568,68 @@ def _sql_crosstalk(records: list[dict], items: list[dict]) -> tuple[int, list]:
             if other_gold == cand:
                 foreign.append((rec["qid"], other_id))
     return own, foreign
+
+
+def _report_power(records: list[dict]) -> None:
+    """把「检测器有没有区分力」变成可证的事实，而不是一句自说自话。
+
+    交叉矩阵说「没命中他人金标」时，读者无法判断这是「真的没串场」还是
+    「检测器瞎了」。所以同时报「命中自己金标」的数量：
+    自己都命中不了，就别拿「没命中别人」当结论。
+    """
+    scored = [r for r in records if "strict_ok" in r]
+    if not scored:
+        return
+    own = sum(1 for r in scored if r["strict_ok"])
+    verdict = "有区分力" if own else "**无区分力，串场结论不成立**"
+    print(f"[严格] 区分力自证：命中自己金标 {own}/{len(scored)} -> {verdict}")
+
+
+def _load_compare():
+    """惰性加载 `evals/run_eval_s5.compare_result`（执行级结果集比对）。"""
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "run_eval_s5", ROOT / "evals" / "run_eval_s5.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.compare_result
+    except Exception as e:                        # noqa: BLE001
+        print(f"[WARN] compare_result 不可用：{type(e).__name__}: {e}")
+        return None
+
+
+def strict_crosstalk(records: list[dict], items: list[dict]) -> list[tuple[str, str]]:
+    """执行级交叉矩阵：存在 i != j 使得 record_i 的 SQL 结果集 == gold_j 的结果集。
+
+    ## 为什么归一化 SQL 比对对 P2 没用
+
+    实测：20 条 P2-E 里 `_norm_sql` 精确命中自己金标 **0/20**，
+    而执行级结果集比对通过 **18/20**。说明模型写出来的 SQL 文本与金标差得远
+    （别名、字段顺序、括号），但结果集一致。
+    在 0/20 的检测器上，「没有命中他人金标」几乎恒成立——
+    那不是「没有串场」，是**检测器看不见**。用结果集比对才有区分力。
+
+    代价：O(N^2) 次 SQL 执行，只适合小的 N（crosstalk 阶段 5-10 条）。
+    """
+    compare = _load_compare()
+    if compare is None:
+        return []
+    gold = {it["id"]: it.get("gold_sql", "") for it in items}
+    hits: list[tuple[str, str]] = []
+    for rec in records:
+        cand = rec.get("sql")
+        if not cand:
+            continue
+        for other_id, other_gold in gold.items():
+            if other_id == rec["qid"] or not other_gold:
+                continue
+            try:
+                ok, _ = compare(other_gold, cand)
+            except Exception:                     # noqa: BLE001
+                continue
+            if ok:
+                hits.append((rec["qid"], other_id))
+    return hits
 
 
 def _warn_if_weak(own: int, n: int) -> None:
