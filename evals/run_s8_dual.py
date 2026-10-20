@@ -125,7 +125,7 @@ def run_one(graph_type: str, graph, answer_fn,
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         print(f"  [{graph_type}] {'PASS' if ok else 'FAIL'} {c['id']} "
               f"status={status} calls={st.get('steps')} tok={st.get('token_cost')} "
-              f"¥{rec['cost_cny']:.4f} ({time.time()-t1:.0f}s)", flush=True)
+              f"￥{rec['cost_cny']:.4f} ({time.time()-t1:.0f}s)", flush=True)
     return results, tracker.as_dict()
 
 

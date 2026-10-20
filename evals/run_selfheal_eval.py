@@ -142,7 +142,7 @@ def main() -> None:
                                 "err": f"校验拦截: {vr.reason}", "sql": fixed_sql[:100],
                                 "cost_cny": item_cost})
                 continue
-            # ⚠️ 用 sqlite3 直连执行拿 tuple rows——execute_with_timeout 返回 dict rows，
+            # 注意：用 sqlite3 直连执行拿 tuple rows——execute_with_timeout 返回 dict rows，
             # 与金标 tuple 混比会迭代出 dict key（曾致自愈全判错）
             try:
                 con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
@@ -167,12 +167,12 @@ def main() -> None:
                             "sql": fixed_sql[:140], "cost_cny": item_cost})
             mark = "HEALED" if healed_ok else "FAIL"
             print(f"[{mark}] {cid} {kind}: {err[:60]} -> {'ok' if healed_ok else 'x'} "
-                  f"¥{item_cost:.4f}/{tracker.calls - calls0}call", flush=True)
+                  f"￥{item_cost:.4f}/{tracker.calls - calls0}call", flush=True)
 
     n = len(results)
     rate = healed / n if n else 0
     print(f"\n===== 自愈专项: {healed}/{n} = {rate:.3f} (验收 ≥0.60) =====")
-    print(f"本轮实测成本 ¥{tracker.cost_cny:.4f} | {tracker.calls} 次调用 "
+    print(f"本轮实测成本 ￥{tracker.cost_cny:.4f} | {tracker.calls} 次调用 "
           f"| 输入 {tracker.input_tokens} tok（缓存命中 {tracker.cache_hit_rate:.1%}）"
           f" | 输出 {tracker.output_tokens} tok", flush=True)
     out_path.write_text(

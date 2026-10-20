@@ -1,5 +1,5 @@
 """
-P2-S5 全量评测（60 条，对应方案手册 ✅ 完成标志与 METRICS 验收线）。
+P2-S5 全量评测（60 条，对应方案手册的完成标志与 METRICS 验收线）。
 
 验收线：
   - SQL 结果准确率 ≥0.80   （normal 类：生成 SQL 结果集与金标一致）
@@ -215,10 +215,10 @@ def main() -> None:
         mark = "PASS" if row["ok"] else "FAIL"
         print(f"[{mark}] {item['id']} [{item['type']}] heal={item.get('heal', False)} "
               f"status={row['status']} retry={row['retry']} ({row['elapsed_s']}s) "
-              f"¥{row['cost_cny']:.4f}/{row['llm_calls']}call "
+              f"￥{row['cost_cny']:.4f}/{row['llm_calls']}call "
               f"{'ok' if row['ok'] else row['detail'][:100]}", flush=True)
 
-    print(f"\n本轮累计成本 ¥{tracker.cost_cny:.4f} | {tracker.calls} 次调用 "
+    print(f"\n本轮累计成本 ￥{tracker.cost_cny:.4f} | {tracker.calls} 次调用 "
           f"| 输入 {tracker.input_tokens} tok（缓存命中 {tracker.cache_hit_rate:.1%}）"
           f" | 输出 {tracker.output_tokens} tok", flush=True)
 
@@ -278,7 +278,7 @@ def main() -> None:
     )
     print(f"\n已写入 {out_path.relative_to(ROOT)}", flush=True)
     if aborted:
-        print("⚠ 本轮因超预算熔断，结果池可能不满 60 条 —— 充值后用同一 --tag 续跑即可", flush=True)
+        print("[WARN] 本轮因超预算熔断，结果池可能不满 60 条 —— 充值后用同一 --tag 续跑即可", flush=True)
 
 
 if __name__ == "__main__":

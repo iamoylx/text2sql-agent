@@ -58,12 +58,12 @@ system prompt，保证人人问出一致口径。
 | Supervisor 离线用例 | 5/5 | S8：FakeLLM 驱动全图（happy path / 判官打回循环 / 安全降级 / 规划纠偏） |
 | CTE 白名单用例 | 4/4 | S8 连带修复：WITH 别名不被误杀、不掩盖真越权表 |
 | MCP 协议用例 | **35/35**（`RUN_SLOW=1`）/ 34 + 1 skip（默认） | S7：stdio/http 双传输回环 + 安全不旁路 + 第三方工具动态注册 + **子进程凭据白名单 7 条** + **凭据失败形态 11 条（含接线与反向对照）** + **启动期黑盒验收 3 条 + 入口不可绕过 2 条** |
-| 服务层测试 | pytest **142 passed / 2 skipped**（默认口径）<br>`RUN_SLOW=1` + 配好凭据 → **144 passed / 0 skipped** | 工具双保险 + 安全层 + S9 写路径 + S8 Supervisor + S7 MCP + 场景包 + 成本计量 |
+| 服务层测试 | pytest **147 passed / 2 skipped**（默认口径）<br>`RUN_SLOW=1` + 配好凭据 → **149 passed / 0 skipped** | 工具双保险 + 安全层 + S9 写路径 + S8 Supervisor + S7 MCP + 场景包 + 成本计量 |
 
 **为什么会有 skip、以及为什么这个数必须可复现**：只有两条真实 LLM 用例会跳过
 （`tests/test_tools.py` 与 `tests/test_mcp.py` 各一条），它们由 `RUN_SLOW=1` **显式开关**控制，
 而不是「看谁机器上碰巧有 API key」——否则同一个仓库在别人机器上是 129/2、在我这儿是 131/0，
-简历写「142 passed」就说不清。现在的口径是：**默认（不带任何环境变量、不配任何 key）＝ 142 passed / 2 skipped，
+简历写「147 passed」就说不清。现在的口径是：**默认（不带任何环境变量、不配任何 key）＝ 147 passed / 2 skipped，
 任何机器一致**；要跑全量就 `RUN_SLOW=1`，且需配好凭据（未配则给一条点名变量的 skip，而不是红）。
 其余用例**零外部依赖**：不联网、不读凭据、不需要人工准备数据。
 
@@ -286,14 +286,14 @@ python scripts/run_api.py          # http://127.0.0.1:8501
 ### 6. 自检（不耗 LLM 额度）
 
 ```bash
-python -m pytest -q                # 默认 142 passed / 2 skipped，任何机器一致
+python -m pytest -q                # 默认 147 passed / 2 skipped，任何机器一致
 python evals/run_eval_s5.py        # 60 条全量评测（需 LLM，约 ¥0.18）
 python evals/run_selfheal_eval.py  # 自愈专项（需 LLM，约 ¥0.04）
 ```
 
 > 为什么会有 2 个 skip：只有两条用例真调 LLM，由 `RUN_SLOW=1` 显式控制。
 > 默认口径下整套测试**零外部依赖**（不联网、不读凭据、不需准备数据），
-> 所以「142 passed / 2 skipped」在任何机器上都能复现。
+> 所以「147 passed / 2 skipped」在任何机器上都能复现。
 
 ### 常见卡点
 
@@ -302,6 +302,7 @@ python evals/run_selfheal_eval.py  # 自愈专项（需 LLM，约 ¥0.04）
 | 建库报「缺少 N 个数据集文件」（退出码 2） | 第 2 步没做或文件名不对；报错里直接给了 Kaggle 链接和 `data/raw/` 路径，缺几个列几个 |
 | 启动报「未读取到 DEEPSEEK_API_KEY」（退出码 1） | `.env` 没配或 `LLM_PROVIDER` 拼错；报错文案会点名变量 |
 | 行数校验出现 `[MISMATCH]` | 数据集版本不同或 CSV 被截断，对照官方行数核对 |
+| 脚本输出乱码或 `UnicodeEncodeError: 'gbk' codec can't encode` | Windows 控制台是 cp936(GBK)——能编中文，编不了 emoji 和 `¥`(U+00A5)。代码里统一用 `[OK]`/`[WARN]`/`[FAIL]` 和 `￥`(U+FFE5)，`tests/test_output_encoding.py` 的 AST 闸门守着；若仍撞见，跑该测试会点名到 file:line |
 | 429 / 限流 | 免费额度常见；换 DeepSeek 或降低并发 |
 
 ## 代码导读（推荐阅读顺序）

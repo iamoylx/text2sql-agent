@@ -82,7 +82,7 @@ def main() -> None:
     print(f"9 表共 {sum(counts.values()):,} 行，耗时 {time.time()-t0:.0f}s")
     if bad:
         sys.exit(f"行数校验失败: {bad}")
-    print("行数全校验通过 ✅")
+    print("行数全校验通过 [OK]")
 
 
 if __name__ == "__main__":

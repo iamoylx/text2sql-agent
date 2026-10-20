@@ -20,7 +20,7 @@
 | 2 | supervisor「token 更低」这一优势 | 视为普惠结论 | **未复现**（DeepSeek 上成本反 **+62%**） | 模型行为不同：supervisor 每次修订的上下文都在变，缓存命中率 **62.8%**，远低于 agentic 的 **84.0%** | 同上；「何时选谁」的推荐口径 |
 | 3 | S5 端到端（DeepSeek） | 0.7593（41/54） | **0.7963**（43/54） | `empty_result` 判据从「查关键词」改为「结果集语义比对」，纠正 2 条**答对却被判错**的用例 | S5 章节、README 指标表 |
 | 4 | S8 supervisor 正确率（DeepSeek） | 0.875（7/8） | **1.000（8/8）** | 原 7/8 的唯一失败 b5 是 AGNES 免费额度 429，换不限流提供方后不再发生 | S8 章节、README 指标表 |
-| 5 | 测试总数 | 81 passed + **2 skipped** →（一度写成）142 passed / **0 skipped** | **142 passed / 2 skipped（默认口径，机器无关）**；`RUN_SLOW=1` + 凭据 → **144 passed / 0 skipped** | 条数一路涨（110→114→125→131→133→142→144），但**「0 skipped」只在我这台配了 key 的机器上成立**：两条真 LLM 用例原先按「settings 里有没有凭据」自动 skip，别人克隆下来就是 129/2。已统一改成 `RUN_SLOW=1` 显式门控，默认任何机器都 142/2 | README 测试小节 |
+| 5 | 测试总数 | 81 passed + **2 skipped** →（一度写成）147 passed / **0 skipped** | **147 passed / 2 skipped（默认口径，机器无关）**；`RUN_SLOW=1` + 凭据 → **149 passed / 0 skipped** | 条数一路涨（110→114→125→131→133→142→144→147→149），但**「0 skipped」只在我这台配了 key 的机器上成立**：两条真 LLM 用例原先按「settings 里有没有凭据」自动 skip，别人克隆下来就是 129/2。已统一改成 `RUN_SLOW=1` 显式门控，默认任何机器都 147/2 | README 测试小节 |
 | 6 | MCP 子进程凭据取值源 | `os.environ` | **`settings`** | 只读 `os.environ` 会漏掉**只写在 `.env` 里**的值（AGNES 时代靠子进程自己读 CWD 的 `.env` 兜底才没出事） | `src/mcp_client.py`、README MCP 章节 |
 
 **判定规则（防再次踩坑）**：
@@ -410,8 +410,8 @@ CWD 的 `.env` 兜底（同一处兜底掩盖了同一个缺陷两次）。改�
 > 才能把「从哪儿取」这件事变成一个可判定的可观测量。
 
 回归计数（2026-10-18，两套口径且**机器无关**）：
-`pytest tests/` 默认 → **142 passed / 2 skipped**（不带任何环境变量、不配任何 key 都是这个数）；
-`RUN_SLOW=1` + 配好凭据 → **144 passed / 0 skipped**。
+`pytest tests/` 默认 → **147 passed / 2 skipped**（不带任何环境变量、不配任何 key 都是这个数）；
+`RUN_SLOW=1` + 配好凭据 → **149 passed / 0 skipped**。
 `pytest tests/test_mcp.py` 对应为 **34 passed / 1 skipped** 与 **35 passed**。
 
 ### 服务端启动期体检 + 黑盒进程验收（2026-10-18 第二轮）
@@ -602,12 +602,12 @@ CWD 的 `.env` 兜底（同一处兜底掩盖了同一个缺陷两次）。改�
 
 前两次的教训是「我这儿绿不算数」；第三次更微妙：**没有任何人报错、也没有任何断言变红**，
 只是数字对不上。但对开源作品来说，**可复现性本身就是产品属性**——
-简历上写「142 passed」，面试官克隆下来跑出 129/2，这条指标立刻从资产变成负债。
+简历上写「147 passed」，面试官克隆下来跑出 129/2，这条指标立刻从资产变成负债。
 
 根因是两条真 LLM 用例按「settings 里有没有凭据」**自动** skip：这比「看 shell 里有没有
 `os.environ[...]`」好，但仍让通过数随环境漂移。修法取**统一开关**而不是双口径并列：
 两条真 LLM 用例都挂 `@pytest.mark.skipif(os.environ.get("RUN_SLOW") != "1", ...)`
-（与 `test_tools.py` 原有写法对齐），**默认任何机器都是 142 passed / 2 skipped**，
+（与 `test_tools.py` 原有写法对齐），**默认任何机器都是 147 passed / 2 skipped**，
 要跑全量显式 `RUN_SLOW=1`。
 
 > 为什么不选「双口径并列写两个数」：两个数都对，但**读的人永远不知道该信哪个**，
@@ -674,7 +674,7 @@ judge，每例 4-8 次连发）必触免费档突发限额。**运维洞察：�
 | 其余 81 例 | 全离线（FakeLLM / 本地算力），评测卫生保持干净 | 81 passed |
 
 > 上表是 **AGNES 时代的历史快照**（当时那两条只能 skip）。换 DeepSeek 后两条均真跑，
-> 当前计数见文首「数字变更记录」第 5 行（默认 **142 passed / 2 skipped**；`RUN_SLOW=1` → 144/0）。
+> 当前计数见文首「数字变更记录」第 5 行（默认 **147 passed / 2 skipped**；`RUN_SLOW=1` → 149/0）。
 
 > 原文写「唯一真实 LLM 消费点」不准确，已订正。同时修掉一个**评测假象**：
 > 该 MCP 用例原先只处理「网关返回 429（错误在 dict 的 `error` 字段里）」这一种失败形态，
@@ -898,4 +898,76 @@ judge，每例 4-8 次连发）必触免费档突发限额。**运维洞察：�
 > 一个够宽的断言会让一个够具体的缺陷完全隐形。
 
 **回归证据**：`--help` rc=0；完整重建 9 表行数全 `OK`、8.6s、135.2 MB；
-全量 `142 passed / 2 skipped`（131 + 新增 11）。
+全量 `147 passed / 2 skipped`（131 + 新增 11 + 编码闸门 5）。
+
+## 输出编码闸门：GBK 能编中文，编不了 emoji 和 ¥（2026-10-20 第三轮）
+
+承接 P1 那次 `✅` 崩溃，用同一条规则扫 P2，发现**输出路径上还有 4 处**：
+
+| 文件 | 字符 | 崩在哪 |
+|---|---|---|
+| `scripts/init_db_mysql.py` | `✅` | **成功路径** `print("行数全校验通过 ✅")` |
+| `evals/run_eval_s5.py` | `⚠` `¥` | **熔断提示** + 成本汇总 |
+| `evals/run_selfheal_eval.py` | `¥` | 成本汇总 |
+| `evals/run_s8_dual.py` | `¥` | 单条成本 |
+| `src/core/cost.py` | `¥` | `BudgetExceeded` 消息 + `report()` |
+
+### 最反直觉的一条：`¥` 不在 GBK 里
+
+`'¥'.encode('gbk')` → `UnicodeEncodeError: '\xa5'`。GBK 里的人民币符号是
+**`￥`（U+FFE5，编码 `a3a4`）**，`¥`（U+00A5）编不了。两者字形几乎一致，肉眼区分不出。
+
+同批实测的「能 / 不能」对照（**不能凭感觉，要逐个 encode 验**）：
+
+| 编不了 | 可以 |
+|---|---|
+| `¥` U+00A5、`⚠` U+26A0、`✅` U+2705、`❌` U+274C | `→` U+2192、`—` U+2014、`·` U+00B7 |
+| `⇒` U+21D2、`↳` U+21B3、`−` U+2212 | `★` U+2605、`Δ` U+0394（GB2312 含希腊字母） |
+
+所以 `¥`→`￥`、`⇒`/`↳`→`→`、`−`→`-`、`✅`→`[OK]`、`⚠`→`[WARN]`、`❌`→`[FAIL]`。
+
+### 闸门：`tests/test_output_encoding.py`（5 条，0.17s，全离线）
+
+**用 AST 而不是正则**，理由是实测出来的：正则/整文件替换分不开
+「`print()` 里的字符」和「prompt / 产品文案里的字符」。
+
+证据来自 P1（同一轮、同一规则）：那边第一次清扫用**整文件替换**，结果改到了三处必须
+保留 emoji 的地方——`src/graph/nodes.py` 喂给 LLM 的重生成提示、`src/retrieval/embeddings.py`
+的用户可见降级提示、`final_answer` 的拦截文案。改 prompt 等于改模型输入，指标立刻失去
+可比性。回滚后改成 AST 只认 `Call`/`Raise` 节点，才不再越界。
+本仓库（P2）没有踩到，但规则是同一条，闸门按同一标准写。
+
+| 用例 | 钉住什么 |
+|---|---|
+| `test_output_paths_are_console_encodable` | 全仓库输出字符串必须 GBK 可编码 |
+| `test_scanner_ignores_comments_and_docstrings` | 同文本进注释不红、进 `print` 才红 |
+| `test_scanner_catches_raise_messages_too` | `raise X("✅")` 也要抓 |
+| `test_cost_report_is_console_encodable` | 运行时求值，补静态闸门看不见的格式化函数 |
+| `test_budget_exceeded_message_is_console_encodable` | 熔断消息走**真实 `on_llm_end` 路径**，顺带断言用的是 `￥` 而非 `¥` |
+
+### 闸门的覆盖盲区（诚实标注）
+
+静态闸门只看 `print/sys.exit/logging.*/warnings.warn/argparse.error` 与 `raise`。
+**管不到「返回字符串、由调用方打印」的格式化函数**（`CostTracker.report()` 就是）。
+处理方式不是放宽闸门（一放宽就开始误伤 prompt），而是**给每个已知格式化函数配一条
+运行时用例**——静态闸门负责面，运行时用例负责点。这条边界写进了闸门 docstring。
+
+### 变异验证
+
+| 变异 | 红在哪 |
+|---|---|
+| `cost.py` 的 `￥` 改回 `¥` | `test_output_paths_are_console_encodable`，点名 `src/core/cost.py:106` |
+| `run_eval_s5.py` 的 `[WARN]` 改回 `⚠` | 同上，点名 `evals/run_eval_s5.py:281` |
+| `init_db_mysql.py` 的 `[OK]` 改回 `✅` | 同上，点名 `scripts/init_db_mysql.py:85` |
+
+### GBK 真实运行证据
+
+```
+$ PYTHONIOENCODING=gbk python -c "from src.core.cost import CostTracker; print(CostTracker().report())"
+退出码 = 0        # 修复前必崩：UnicodeEncodeError: 'gbk' codec can't encode character '\xa5'
+```
+
+**范围说明**：闸门只扫 `*.py`。`README.md` / `METRICS.md` 里的 `✅` `⚠` `¥` 全部保留——
+GitHub 按 UTF-8 渲染，emoji 是加分项。
+
+回归：`pytest tests/` → **147 passed / 2 skipped**（131 + init_db 11 + 编码闸门 5），63.75s。
