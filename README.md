@@ -58,12 +58,12 @@ system prompt，保证人人问出一致口径。
 | Supervisor 离线用例 | 5/5 | S8：FakeLLM 驱动全图（happy path / 判官打回循环 / 安全降级 / 规划纠偏） |
 | CTE 白名单用例 | 4/4 | S8 连带修复：WITH 别名不被误杀、不掩盖真越权表 |
 | MCP 协议用例 | **35/35**（`RUN_SLOW=1`）/ 34 + 1 skip（默认） | S7：stdio/http 双传输回环 + 安全不旁路 + 第三方工具动态注册 + **子进程凭据白名单 7 条** + **凭据失败形态 11 条（含接线与反向对照）** + **启动期黑盒验收 3 条 + 入口不可绕过 2 条** |
-| 服务层测试 | pytest **131 passed / 2 skipped**（默认口径）<br>`RUN_SLOW=1` + 配好凭据 → **133 passed / 0 skipped** | 工具双保险 + 安全层 + S9 写路径 + S8 Supervisor + S7 MCP + 场景包 + 成本计量 |
+| 服务层测试 | pytest **142 passed / 2 skipped**（默认口径）<br>`RUN_SLOW=1` + 配好凭据 → **144 passed / 0 skipped** | 工具双保险 + 安全层 + S9 写路径 + S8 Supervisor + S7 MCP + 场景包 + 成本计量 |
 
 **为什么会有 skip、以及为什么这个数必须可复现**：只有两条真实 LLM 用例会跳过
 （`tests/test_tools.py` 与 `tests/test_mcp.py` 各一条），它们由 `RUN_SLOW=1` **显式开关**控制，
 而不是「看谁机器上碰巧有 API key」——否则同一个仓库在别人机器上是 129/2、在我这儿是 131/0，
-简历写「131 passed」就说不清。现在的口径是：**默认（不带任何环境变量、不配任何 key）＝ 131 passed / 2 skipped，
+简历写「142 passed」就说不清。现在的口径是：**默认（不带任何环境变量、不配任何 key）＝ 142 passed / 2 skipped，
 任何机器一致**；要跑全量就 `RUN_SLOW=1`，且需配好凭据（未配则给一条点名变量的 skip，而不是红）。
 其余用例**零外部依赖**：不联网、不读凭据、不需要人工准备数据。
 
@@ -241,8 +241,9 @@ data/raw/
 ```
 
 > 官方 `olist_geolocation_dataset.csv` 有 100 万行 / 58 MB，是最大的一个。
-> **9 个 CSV 必须放全**——`init_db.py` 逐表 `read_csv`，缺任何一个都会在那一张表上
-> 直接 `FileNotFoundError` 中断（不会静默跳过）。
+> **9 个 CSV 必须放全**——`init_db.py` 建库前会先跑一次前置检查，缺哪几个就一次列全
+> （附 Kaggle 链接与 `data/raw/` 路径），然后以退出码 `2` 结束。
+> 不会「读一张崩一张」，也**不会先删旧库再崩**。
 
 ### 3. 建库
 
@@ -285,22 +286,22 @@ python scripts/run_api.py          # http://127.0.0.1:8501
 ### 6. 自检（不耗 LLM 额度）
 
 ```bash
-python -m pytest -q                # 默认 131 passed / 2 skipped，任何机器一致
+python -m pytest -q                # 默认 142 passed / 2 skipped，任何机器一致
 python evals/run_eval_s5.py        # 60 条全量评测（需 LLM，约 ¥0.18）
 python evals/run_selfheal_eval.py  # 自愈专项（需 LLM，约 ¥0.04）
 ```
 
 > 为什么会有 2 个 skip：只有两条用例真调 LLM，由 `RUN_SLOW=1` 显式控制。
 > 默认口径下整套测试**零外部依赖**（不联网、不读凭据、不需准备数据），
-> 所以「131 passed / 2 skipped」在任何机器上都能复现。
+> 所以「142 passed / 2 skipped」在任何机器上都能复现。
 
 ### 常见卡点
 
 | 现象 | 原因 / 处理 |
 |---|---|
-| `FileNotFoundError: data/raw/olist_orders_dataset.csv` | 第 2 步没做或文件名不对 |
-| 启动报「未读取到 DEEPSEEK_API_KEY」 | `.env` 没配或 `LLM_PROVIDER` 拼错；报错文案会点名变量 |
-| 行数校验出现 ⚠️ | 数据集版本不同或 CSV 被截断，对照官方行数核对 |
+| 建库报「缺少 N 个数据集文件」（退出码 2） | 第 2 步没做或文件名不对；报错里直接给了 Kaggle 链接和 `data/raw/` 路径，缺几个列几个 |
+| 启动报「未读取到 DEEPSEEK_API_KEY」（退出码 1） | `.env` 没配或 `LLM_PROVIDER` 拼错；报错文案会点名变量 |
+| 行数校验出现 `[MISMATCH]` | 数据集版本不同或 CSV 被截断，对照官方行数核对 |
 | 429 / 限流 | 免费额度常见；换 DeepSeek 或降低并发 |
 
 ## 代码导读（推荐阅读顺序）
