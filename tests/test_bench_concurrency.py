@@ -255,6 +255,59 @@ def test_sql_crosstalk_ignores_missing_sql():
     assert own == 0 and foreign == []
 
 
+# ---------------------------------------------------------------- 代理绕过
+def test_client_kwargs_disable_env_proxy():
+    """**压测必须绕开环境代理**——实测踩出来的，不是预防性洁癖。
+
+    本机 shell 设了 `HTTP_PROXY=http://127.0.0.1:50297`（Clash）且没有 `NO_PROXY`。
+    httpx 默认 `trust_env=True`，于是「压测本地服务」实际压的是代理：
+    `/api/schema` 单发 22ms，10 并发 P50 直接变成 **13.5s**，
+    而它只是序列化一个 8KB 的内存字典。第一版读数差点让人得出
+    「FastAPI 框架层很慢」的结论——**归因错比没数据更糟**。
+    """
+    import httpx
+
+    kw = bench.client_kwargs(conc=10, timeout_s=180.0)
+    assert kw["trust_env"] is False, "缺 trust_env=False，请求会被环境代理接管"
+    assert kw["follow_redirects"] is False
+
+    cli = httpx.AsyncClient(**kw)
+    try:
+        assert cli._trust_env is False
+    finally:
+        import asyncio
+        asyncio.run(cli.aclose())
+
+
+def test_env_proxy_would_actually_hijack_requests(monkeypatch):
+    """反向证明：开着 `trust_env` 时请求**确实**会被改道到代理。
+
+    只断言「我们关掉了」是单边的——万一 httpx 哪天不再读 env，上一条就变成永真。
+    实测（httpx 0.28.1）：代理挂在 transport 的 connection pool 上
+    （`_pool._proxy_url`），不在 `_mounts` 的键名里（键是 URLPattern 对象）。
+    直连时 pool 是普通 `ConnectionPool`，连 `_proxy_url` 属性都没有。
+    """
+    import httpx
+
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:59999")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+
+    target = httpx.URL("http://127.0.0.1:501/whatever")
+    hijacked = httpx.Client(trust_env=True)
+    direct = httpx.Client(**bench.client_kwargs(conc=2, timeout_s=5.0))
+    try:
+        pool_proxy = getattr(hijacked._transport_for_url(target)._pool,
+                             "_proxy_url", None)
+        assert pool_proxy is not None, "trust_env=True 时请求应被环境代理接管"
+        assert "59999" in str(pool_proxy)
+        assert getattr(direct._transport_for_url(target)._pool,
+                       "_proxy_url", None) is None
+    finally:
+        hijacked.close()
+        direct.close()
+
+
 # ---------------------------------------------------------------- 控制台编码
 def test_markdown_row_is_console_encodable():
     """markdown 行要能打到 GBK 控制台。
