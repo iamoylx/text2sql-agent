@@ -20,7 +20,7 @@
 | 2 | supervisor「token 更低」这一优势 | 视为普惠结论 | **未复现**（DeepSeek 上成本反 **+62%**） | 模型行为不同：supervisor 每次修订的上下文都在变，缓存命中率 **62.8%**，远低于 agentic 的 **84.0%** | 同上；「何时选谁」的推荐口径 |
 | 3 | S5 端到端（DeepSeek） | 0.7593（41/54） | **0.7963**（43/54） | `empty_result` 判据从「查关键词」改为「结果集语义比对」，纠正 2 条**答对却被判错**的用例 | S5 章节、README 指标表 |
 | 4 | S8 supervisor 正确率（DeepSeek） | 0.875（7/8） | **1.000（8/8）** | 原 7/8 的唯一失败 b5 是 AGNES 免费额度 429，换不限流提供方后不再发生 | S8 章节、README 指标表 |
-| 5 | 测试总数 | 81 passed + **2 skipped** →（一度写成）150 passed / **0 skipped** | **150 passed / 2 skipped（默认口径；前提是库存在，CI 用合成库补齐）**；`RUN_SLOW=1` + 凭据 → **152 passed / 0 skipped** | 条数一路涨（110→114→125→131→133→142→144→147→149→150→152），但**「0 skipped」只在我这台配了 key 的机器上成立**：两条真 LLM 用例原先按「settings 里有没有凭据」自动 skip，别人克隆下来就是 129/2。已统一改成 `RUN_SLOW=1` 显式门控，默认 150/2（需有库，见 CI 一节） | README 测试小节 |
+| 5 | 测试总数 | 81 passed + **2 skipped** →（一度写成）150 passed / **0 skipped** | **152 passed / 2 skipped（默认口径；前提是库存在，CI 用合成库补齐）**；`RUN_SLOW=1` + 凭据 → **154 passed / 0 skipped** | 条数一路涨（110→114→125→131→133→142→144→147→149→150→152→154），但**「0 skipped」只在我这台配了 key 的机器上成立**：两条真 LLM 用例原先按「settings 里有没有凭据」自动 skip，别人克隆下来就是 129/2。已统一改成 `RUN_SLOW=1` 显式门控，默认 152/2（需有库，见 CI 一节） | README 测试小节 |
 | 6 | MCP 子进程凭据取值源 | `os.environ` | **`settings`** | 只读 `os.environ` 会漏掉**只写在 `.env` 里**的值（AGNES 时代靠子进程自己读 CWD 的 `.env` 兜底才没出事） | `src/mcp_client.py`、README MCP 章节 |
 
 **判定规则（防再次踩坑）**：
@@ -410,7 +410,7 @@ CWD 的 `.env` 兜底（同一处兜底掩盖了同一个缺陷两次）。改�
 > 才能把「从哪儿取」这件事变成一个可判定的可观测量。
 
 回归计数（2026-10-18，两套口径且**机器无关**）：
-`pytest tests/` 默认 → **150 passed / 2 skipped**（不配任何 key、不联网）；**前提是 `data/db/olist.db` 存在**——干净克隆里没有，CI 用 `scripts/make_fixture_db.py` 生成合成库；
+`pytest tests/` 默认 → **152 passed / 2 skipped**（不配任何 key、不联网）；**前提是 `data/db/olist.db` 存在**——干净克隆里没有，CI 用 `scripts/make_fixture_db.py` 生成合成库；
 `RUN_SLOW=1` + 配好凭据 → **152 passed / 0 skipped**。
 `pytest tests/test_mcp.py` 对应为 **34 passed / 1 skipped** 与 **35 passed**。
 
@@ -602,12 +602,12 @@ CWD 的 `.env` 兜底（同一处兜底掩盖了同一个缺陷两次）。改�
 
 前两次的教训是「我这儿绿不算数」；第三次更微妙：**没有任何人报错、也没有任何断言变红**，
 只是数字对不上。但对开源作品来说，**可复现性本身就是产品属性**——
-简历上写「150 passed」，面试官克隆下来跑出 129/2，这条指标立刻从资产变成负债。
+简历上写「152 passed」，面试官克隆下来跑出 129/2，这条指标立刻从资产变成负债。
 
 根因是两条真 LLM 用例按「settings 里有没有凭据」**自动** skip：这比「看 shell 里有没有
 `os.environ[...]`」好，但仍让通过数随环境漂移。修法取**统一开关**而不是双口径并列：
 两条真 LLM 用例都挂 `@pytest.mark.skipif(os.environ.get("RUN_SLOW") != "1", ...)`
-（与 `test_tools.py` 原有写法对齐），**默认口径 150 / 2（前提是库已就绪）**，
+（与 `test_tools.py` 原有写法对齐），**默认口径 152 / 2（前提是库已就绪）**，
 要跑全量显式 `RUN_SLOW=1`。
 
 > 为什么不选「双口径并列写两个数」：两个数都对，但**读的人永远不知道该信哪个**，
@@ -674,7 +674,7 @@ judge，每例 4-8 次连发）必触免费档突发限额。**运维洞察：�
 | 其余 81 例 | 全离线（FakeLLM / 本地算力），评测卫生保持干净 | 81 passed |
 
 > 上表是 **AGNES 时代的历史快照**（当时那两条只能 skip）。换 DeepSeek 后两条均真跑，
-> 当前计数见文首「数字变更记录」第 5 行（默认 **150 passed / 2 skipped**；`RUN_SLOW=1` → 149/0）。
+> 当前计数见文首「数字变更记录」第 5 行（默认 **152 passed / 2 skipped**；`RUN_SLOW=1` → 全部 154 条不 skip）。
 
 > 原文写「唯一真实 LLM 消费点」不准确，已订正。同时修掉一个**评测假象**：
 > 该 MCP 用例原先只处理「网关返回 429（错误在 dict 的 `error` 字段里）」这一种失败形态，
@@ -1089,3 +1089,121 @@ ruff check --select E9,F63,F7,F82,F401,F811,F841,F821,F822,F823
 | README | 顶部 CI 徽章；订正「零外部依赖/不需准备数据」的过度声称 |
 
 计数变化：147 → **150 passed / 2 skipped**（+3 服务端导入用例）。
+
+---
+
+## T2 · Docker 从零补齐：首跑两条全红，两个根因（2026-10-20）
+
+### 为什么这套东西只能靠 CI 验证
+
+开发机是 Windows + **没有装 Docker**（`docker: command not found`，
+`wsl.exe` 还被本机安全策略直接拉黑）。也就是说 Dockerfile / compose
+**无法在提交前本地验证任何一行**。落地的验证全部在 GitHub runner 上做：
+
+| job | 跑什么 | 结果 |
+|---|---|---|
+| `image` | `docker build --target test` → 容器内 pytest | 首跑 **FAIL** → 修完 PASS |
+| `compose` | build → 备合成库 → `up -d --wait` → health → schema(9 表) → 静态首页 → 容器内只读查一行 → down | 首跑 **FAIL** → 修完 PASS |
+
+本地能验的部分都验了：YAML 解析、ruff、pytest 152/2、`run_api` 用
+`API_HOST=0.0.0.0 API_PORT=8599` 真起一遍（`/api/health` 200、`GET /` 200）。
+
+### 失败一：服务端起不来 —— 一个真 bug，不只是镜像问题
+
+`image` job 的红在「生产镜像自检：能导入应用」。复现与定位：
+
+```
+docker run p2:runtime python -c "import src.api.server"
+→ sqlite3.OperationalError: unable to open database file
+```
+
+`server.py` 在**导入期**就调 `_svc_init()` 落 `data/db/service.db`，
+而 `sqlite3.connect()` **不会创建缺失的父目录**。镜像里不带 `data/`（数据走卷挂载），
+容器首次启动时 `/app/data/db` 不存在 → 服务根本起不来。
+
+**本地永远复现不了**：本地 `data/db/` 早被 135 MB 的真实库占着了。
+本地一比一模拟（只拷 `src/ scripts/ web/ evals/`，无 `data/`）才能红。
+
+修法**不是**只在 Dockerfile 里补 `mkdir`——那只让「这一种部署方式」能用。
+真正的修法在 `_svc_conn()` 里 `mkdir(parents=True, exist_ok=True)`：
+**服务应当能自己创建它要写的目录**，否则任何「干净机器首次部署」都得靠外部先备好
+目录结构，那是部署脚本的责任泄漏。Dockerfile 里也补了 `mkdir`，但理由不同
+——那是为了让 `VOLUME` 声明的匿名卷继承到目录结构。
+
+变异对照：把 `Path.mkdir` 打成 no-op → 原 `OperationalError` 精确重现。
+已加 `tests/test_server_import.py::test_svc_db_creates_missing_parent_dir`。
+
+### 失败二：compose 被「没启用的服务」拖死
+
+`compose` job 的 `docker compose build` 失败，而且连 `if: always()` 的
+`docker compose down` 收尾步骤也一起红。根因：
+
+```yaml
+mysql:
+  profiles: ["mysql"]                       # 默认不启动
+  environment:
+    MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PWD:?...}   # ← 这里
+```
+
+**compose 会先对整个文件做变量插值、再按 profile 过滤服务。**
+所以即使 mysql 处于未激活的 profile，缺这个变量也会让整条
+`docker compose up`（乃至 `down`）报
+`required variable MYSQL_ROOT_PWD is missing a value` 而整体失败。
+
+改成 `${MYSQL_ROOT_PWD:-dev_only_change_me}`（本地开发兜底，生产必须显式覆盖）。
+顺带修 healthcheck：原来写 `-p${MYSQL_ROOT_PWD}` 是**宿主侧插值**，未设变量时变成
+空密码，与容器里实际的密码不一致 → 健康检查永远红。改用 `$$MYSQL_ROOT_PASSWORD`
+（compose 转义成字面 `$`），让密码取自**容器自己的**环境变量。
+
+> 这条已经写进 P1 的 `docker.yml`：加一步 `docker compose config --quiet`。
+> 它很便宜，专治这一类「某个没启用的服务里一个 `:?` 就让全流程红」。
+
+### 另一个必须绕开的坑：compose 不要转发 DB_URL
+
+compose 自动读项目根 `.env` 做插值，而本机 `.env` 里真实写着：
+
+```
+DB_URL=sqlite:///D:/Myprojects/text2sql-agent/data/db/olist.db
+```
+
+一旦写成 `DB_URL: ${DB_URL:-...}`，这个 **Windows 路径会被原样塞进 Linux 容器**。
+症状极具误导性：服务起来了、`docker ps` 显示 healthy、`/api/health` 也 200，
+但一查询就 `unable to open database file`。
+
+写成 `DB_URL: ${DB_URL:-}` 同样坏——空串会**覆盖**掉 `config.py` 里的正确默认值
+（pydantic-settings 认为「显式传了空值」）。
+
+所以 `DB_URL / DB_RO_URI` 一律不在 compose 里声明，让容器按 `PROJECT_ROOT=/app`
+自己拼；要切 MySQL 就在命令行显式 `-e DB_URL=...`。
+
+### 镜像里到底该有哪几个目录：这一课的代价
+
+| 目录 | 为什么必须 | 少了的后果 |
+|---|---|---|
+| `src/` | 被测代码 + `mcp_server.py` 子进程入口 | `ModuleNotFoundError` |
+| `web/` | `app` 在**导入期**挂 `StaticFiles(PROJECT_ROOT/"web")` | Starlette 抛 `RuntimeError` |
+| `evals/` | `src/agent/fewshot.py` **运行期**读 `evals/few_shots.json` | Few-shot 检索静默失效 |
+| `scripts/` | 用例直接 import `make_fixture_db` / `init_db` | 收集期 error |
+| `tests/` | 测试本体 | 没得跑 |
+
+`evals/` 这一项尤其反直觉：它在 P1 是**纯开发期工具**（不该进镜像），
+在 P2 却是**运行时资源**。判断依据只能是「运行期是否读它」，不是「它叫什么名字」。
+
+顺带堵住一个静默降级：`tests/test_output_encoding.py` 的 `_py_files()` 是
+`if not base.exists(): continue`——扫描目录缺一个就**悄悄少扫**，
+「零违规」与「没扫」变得不可区分。新增 `test_all_scan_dirs_present` 断言四个
+扫描目录齐全。变异验证：把 `evals` 改名后该用例报红并点名 `['evals']`。
+
+### 新增/改动
+
+| 文件 | 作用 |
+|---|---|
+| `Dockerfile` | `base → test → runtime`，**生产放最后**（`docker build .` 默认取最后阶段） |
+| `docker-compose.yml` | api + 可选 mysql（profile 隔离）；healthcheck 用 python 而非 curl（slim 镜像没有 curl） |
+| `.dockerignore` | 把 135 MB 真实库 / 58 MB CSV / `.env` 挡在上下文外 |
+| `scripts/run_api.py` | `API_HOST` / `API_PORT` 可配（默认仍是 127.0.0.1） |
+| `scripts/init_db_mysql.py` | `MYSQL_HOST/PORT/DB` 可配（compose 里服务名是 `mysql`） |
+| `requirements.txt` | 补 `PyMySQL`——`.env.example` 写着「切 MySQL 只改一行 DB_URL」，少了它那行改完就是 ModuleNotFoundError |
+| `.github/workflows/docker.yml` | 上述两个 job |
+
+计数变化：150 → **152 passed / 2 skipped**（+1 数据目录用例 +1 扫描目录用例）。

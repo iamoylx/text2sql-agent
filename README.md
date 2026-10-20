@@ -62,12 +62,12 @@ system prompt，保证人人问出一致口径。
 | MCP 协议用例 | **35/35**（`RUN_SLOW=1`）/ 34 + 1 skip（默认） | S7：stdio/http 双传输回环 + 安全不旁路 + 第三方工具动态注册 + **子进程凭据白名单 7 条** + **凭据失败形态 11 条（含接线与反向对照）** + **启动期黑盒验收 3 条 + 入口不可绕过 2 条** |
 | 建库脚本用例 | 11/11 | `tests/test_init_db.py`：缺 CSV 时点名文件 + 指路 Kaggle（而非裸 `FileNotFoundError`） |
 | 控制台编码闸门 | 5/5 | `tests/test_output_encoding.py`：AST 扫描 print/raise/logging/exit，禁 emoji 与 `¥`(U+00A5)——cp936 编不了，`PYTHONIOENCODING=gbk` 下会崩 |
-| 服务层测试 | pytest **150 passed / 2 skipped**（默认口径）<br>`RUN_SLOW=1` + 配好凭据 → **152 passed / 0 skipped** | 工具双保险 + 安全层 + S9 写路径 + S8 Supervisor + S7 MCP + 场景包 + 成本计量 + 建库脚本 + 编码闸门 |
+| 服务层测试 | pytest **152 passed / 2 skipped**（默认口径）<br>`RUN_SLOW=1` + 配好凭据 → **154 passed / 0 skipped** | 工具双保险 + 安全层 + S9 写路径 + S8 Supervisor + S7 MCP + 场景包 + 成本计量 + 建库脚本 + 编码闸门 |
 
 **为什么会有 skip、以及为什么这个数必须可复现**：只有两条真实 LLM 用例会跳过
 （`tests/test_tools.py` 与 `tests/test_mcp.py` 各一条），它们由 `RUN_SLOW=1` **显式开关**控制，
 而不是「看谁机器上碰巧有 API key」——否则同一个仓库在别人机器上是 147/2、在我这儿是 149/0，
-简历写「150 passed」就说不清。现在的口径是：**默认（不带任何环境变量、不配任何 key）＝ 150 passed / 2 skipped，
+简历写「150 passed」就说不清。现在的口径是：**默认（不带任何环境变量、不配任何 key）＝ 152 passed / 2 skipped，
 任何机器一致**；要跑全量就 `RUN_SLOW=1`，且需配好凭据（未配则给一条点名变量的 skip，而不是红）。
 其余用例**零外部依赖**：不联网、不读凭据、不需要人工准备数据。
 
@@ -287,10 +287,42 @@ python scripts/run_api.py          # http://127.0.0.1:8501
 三栏界面：左 Schema 树 / 中对话（SQL 可折叠、反馈）/ 右结果表 + ECharts。
 试一句：**「2017年各品类销量 Top5，用图表展示」**。
 
-### 6. 自检（不耗 LLM 额度）
+### 6. Docker 一键启动（可选，推荐给「只想跑起来」的人）
 
 ```bash
-python -m pytest -q                # 默认 150 passed / 2 skipped
+docker compose up -d --wait          # api:8501；数据走 ./data 卷，镜像里不带库
+curl http://127.0.0.1:8501/api/health
+open http://127.0.0.1:8501/          # 三栏界面
+```
+
+首次用容器，先让容器把合成库建到卷里（真数据集请按第 2、3 步在宿主机建好再挂进去）：
+
+```bash
+docker compose run --rm --no-deps api python scripts/make_fixture_db.py
+```
+
+| 命令 | 作用 |
+|---|---|
+| `docker compose up -d --wait` | 起 api 并**等到 healthcheck 通过**才返回 |
+| `docker compose down` | 停服务（`./data` 里的库与审计日志保留） |
+| `docker compose --profile mysql up -d mysql` | 额外起 MySQL 8.4（默认 up 不含它） |
+
+> **一个刻意的设计**：compose 里**不转发 `DB_URL`**。compose 会自动读项目根的 `.env`
+> 做变量插值，而 `.env` 里通常写着 `DB_URL=sqlite:///D:/...`——那是宿主机 Windows 路径，
+> 一旦塞进 Linux 容器，症状是「服务起来了、`docker ps` 正常，但一查询就
+> unable to open database file」。所以让容器按 `PROJECT_ROOT=/app` 自己拼默认路径，
+> 要切 MySQL 就在命令行上显式 `-e DB_URL=...`。
+>
+> **容器的两个必要条件**：`API_HOST=0.0.0.0`（`run_api.py` 默认 127.0.0.1 是给本机开发用的，
+> 容器里留着它宿主机就连不上），以及服务自己会 `mkdir` 它的数据目录——
+> 后者是真踩过的坑：`server.py` 导入期就落 `data/db/service.db`，而
+> `sqlite3.connect()` 不会创建缺失的父目录，容器首次启动时 `data/` 不存在就
+> `OperationalError` 直接起不来（本地永远复现不了，因为本地 `data/db/` 早被真实库占着）。
+
+### 7. 自检（不耗 LLM 额度）
+
+```bash
+python -m pytest -q                # 默认 152 passed / 2 skipped
 python evals/run_eval_s5.py        # 60 条全量评测（需 LLM，约 ¥0.18）
 python evals/run_selfheal_eval.py  # 自愈专项（需 LLM，约 ¥0.04）
 ```
@@ -300,22 +332,32 @@ python evals/run_selfheal_eval.py  # 自愈专项（需 LLM，约 ¥0.04）
 >
 > **但默认口径**并非「不需准备数据」**——这一点之前写错了，已订正**：
 > 有 10 条用例要碰 `data/db/olist.db`（135 MB，由 Kaggle 数据集建出，`.gitignore` 排除）。
-> 所以准确说法是「任何**建过库**的机器上 150 / 2」。干净克隆实测是
+> 所以准确说法是「任何**建过库**的机器上 152 / 2」。干净克隆实测是
 > **137 passed / 10 failed / 2 skipped**，10 条全因 `sqlite3.OperationalError`。
 >
 > CI 与干净克隆上用合成库补齐（表结构真实、行数合成，够跑通代码路径）：
 >
 > ```bash
 > python scripts/make_fixture_db.py     # 生成 data/db/olist.db（合成，约 22 MB / 2.4s）
-> python -m pytest -q                   # → 150 passed / 2 skipped
+> python -m pytest -q                   # → 152 passed / 2 skipped
 > ```
 >
 > 真实业务基数由 `init_db.py` 的 `EXPECTED` 行数校验与 METRICS.md 负责，**不由单测负责**
 > ——单测该钉不变量，不该钉数据集基数（`test_safety.py` 里写死 `== 99441` 的那条已改）。
 
-### 7. 持续集成（GitHub Actions）
+### 8. 持续集成（GitHub Actions）
 
 [`ci.yml`](.github/workflows/ci.yml)：`ruff`（真实缺陷类规则）→ 生成合成 fixture 库 → `pytest`。
+
+[`docker.yml`](.github/workflows/docker.yml)：`--target test` 构建 → 容器内 pytest；
+以及 `docker compose up -d --wait` → `/api/health` → `/api/schema`（9 张表）→
+静态首页 → 容器内只读查一行 → `down`。两者都是绿的。
+
+> 为什么 Docker 验证必须放 CI：开发机是 Windows + **没装 Docker**
+> （`docker: command not found`，`wsl.exe` 也被安全策略拉黑），本地无从验证。
+>
+> `docker.yml` 首次真跑**红过一轮**，两个失败同一个根因：`server.py` 导入期落
+> `data/db/service.db` 而目录不存在 → 容器里服务起不来。详见 METRICS.md「T2」。
 推 main / PR 触发，约 4 分钟。
 
 **为什么要单独生成 fixture 库**：库文件不入库，CI 是干净环境。上面那 10 条失败的用例
