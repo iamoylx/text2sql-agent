@@ -61,12 +61,13 @@ system prompt，保证人人问出一致口径。
 | CTE 白名单用例 | 4/4 | S8 连带修复：WITH 别名不被误杀、不掩盖真越权表 |
 | MCP 协议用例 | **35/35**（`RUN_SLOW=1`）/ 34 + 1 skip（默认） | S7：stdio/http 双传输回环 + 安全不旁路 + 第三方工具动态注册 + **子进程凭据白名单 7 条** + **凭据失败形态 11 条（含接线与反向对照）** + **启动期黑盒验收 3 条 + 入口不可绕过 2 条** |
 | 建库脚本用例 | 11/11 | `tests/test_init_db.py`：缺 CSV 时点名文件 + 指路 Kaggle（而非裸 `FileNotFoundError`） |
-| 控制台编码闸门 | 5/5 | `tests/test_output_encoding.py`：AST 扫描 print/raise/logging/exit，禁 emoji 与 `¥`(U+00A5)——cp936 编不了，`PYTHONIOENCODING=gbk` 下会崩 |
-| 服务层测试 | pytest **152 passed / 2 skipped**（默认口径）<br>`RUN_SLOW=1` + 配好凭据 → **154 passed / 0 skipped** | 工具双保险 + 安全层 + S9 写路径 + S8 Supervisor + S7 MCP + 场景包 + 成本计量 + 建库脚本 + 编码闸门 |
+| 服务端导入用例 | 4/4 | `tests/test_server_import.py`：服务自己创建数据目录（镜像首次启动曾因 `sqlite3.connect()` 不建父目录而 `OperationalError`） |
+| 控制台编码闸门 | 6/6 | `tests/test_output_encoding.py`：AST 扫描 print/raise/logging/exit，禁 emoji 与 `¥`(U+00A5)——cp936 编不了，`PYTHONIOENCODING=gbk` 下会崩 |
+| 服务层测试 | pytest **152 passed / 2 skipped**（默认口径；收集 154）<br>`RUN_SLOW=1` + 配好凭据 → **154 passed / 0 skipped** | 工具双保险 + 安全层 + S9 写路径 + S8 Supervisor + S7 MCP + 场景包 + 成本计量 + 建库脚本 + 服务端导入 + 编码闸门 |
 
 **为什么会有 skip、以及为什么这个数必须可复现**：只有两条真实 LLM 用例会跳过
 （`tests/test_tools.py` 与 `tests/test_mcp.py` 各一条），它们由 `RUN_SLOW=1` **显式开关**控制，
-而不是「看谁机器上碰巧有 API key」——否则同一个仓库在别人机器上是 147/2、在我这儿是 149/0，
+而不是「看谁机器上碰巧有 API key」——否则同一个仓库在别人机器上是 152/2、在我这儿是 154/0，
 简历写「150 passed」就说不清。现在的口径是：**默认（不带任何环境变量、不配任何 key）＝ 152 passed / 2 skipped，
 任何机器一致**；要跑全量就 `RUN_SLOW=1`，且需配好凭据（未配则给一条点名变量的 skip，而不是红）。
 其余用例**零外部依赖**：不联网、不读凭据、不需要人工准备数据。
