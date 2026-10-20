@@ -44,7 +44,14 @@ DATE_COLS: dict[str, list[str]] = {
     "order_reviews": ["review_creation_date", "review_answer_timestamp"],
 }
 
-HOST, PORT, DB = "127.0.0.1", 3306, "olist"
+HOST, PORT, DB = (
+    os.environ.get("MYSQL_HOST", "127.0.0.1"),
+    int(os.environ.get("MYSQL_PORT", "3306")),
+    os.environ.get("MYSQL_DB", "olist"),
+)
+# 为什么这三项要能改：本机开发是 127.0.0.1，而 docker compose 里 MySQL 的
+# 服务名是 `mysql`，容器内解析不到 127.0.0.1 上的库。硬编码会让 compose 形态
+# 只能用「导数据前先手改代码」这种反模式。
 
 
 def main() -> None:
