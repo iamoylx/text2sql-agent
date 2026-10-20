@@ -231,7 +231,6 @@ def main() -> None:
         return
 
     norm = [r for r in all_rows if r["type"] in NORMAL_TYPES]
-    empty = [r for r in all_rows if r["type"] == "empty_result"]
     sec = [r for r in all_rows if r["type"] == "security"]
     heal_candidates = [r for r in all_rows if r.get("heal")]
 

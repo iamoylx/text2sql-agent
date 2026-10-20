@@ -165,6 +165,9 @@ class TestCsvImport:
     def test_reimport_overwrites(self, tmp_db):
         import_csv_bytes("over.csv", "a\n1\n", tmp_db)
         r = import_csv_bytes("over.csv", "a\n7\n8\n", tmp_db)
+        # 断言返回值而不是丢掉：重复导入若失败，下面的行数断言会「碰巧」也失败，
+        # 但那时报的是「行数不对」，真正的原因（导入被拒）被掩盖了。
+        assert r.error == "", f"重复导入应成功覆盖，实际报错：{r.error}"
         con = sqlite3.connect(tmp_db)
         n = con.execute("SELECT COUNT(*) FROM csv_over").fetchone()[0]
         v = con.execute("SELECT a FROM csv_over ORDER BY a").fetchall()

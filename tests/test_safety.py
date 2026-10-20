@@ -82,7 +82,12 @@ def test_timeout_interrupts_slow_query():
 
 def test_normal_query_with_timeout_ok():
     ok, err, rows = execute_with_timeout(str(DB), "SELECT COUNT(*) AS c FROM orders")
-    assert ok and rows[0]["c"] == 99441
+    # 断言「>0 且有返回」而不是 == 99441：单元测试该钉**不变量**，不该钉**数据集基数**。
+    # 写死真实行数会让这条用例只能在我这台建过真库的机器上跑——干净克隆里
+    # data/db/olist.db 不存在（135MB，gitignore），CI 用的是 scripts/make_fixture_db.py
+    # 生成的合成库（见该脚本 docstring）。真实基数由 init_db.py 的 EXPECTED 校验
+    # 与 METRICS 负责，那才是该管它的地方。
+    assert ok and rows and rows[0]["c"] > 0
 
 
 # ---------------- S8 补：CTE 别名不得被表名白名单误杀 ----------------

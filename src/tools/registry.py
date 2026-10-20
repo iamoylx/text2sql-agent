@@ -15,8 +15,7 @@ dispatch     —— 服务端分发：参数先进 Pydantic（models.PARAM_MODEL
 """
 from __future__ import annotations
 
-import json
-from typing import Any, Callable
+from typing import Any
 
 from pydantic import ValidationError
 

@@ -20,9 +20,16 @@ Prompt 渲染模块（P2-S2 Schema 注入 + Few-shot 检索的 Prompt 侧）。
 from __future__ import annotations
 
 import re
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
 from src.db.schema import RELATIONS, TABLES
+
+if TYPE_CHECKING:
+    # 仅用于注解（本模块有 `from __future__ import annotations`，注解不参与运行时求值）。
+    # 不放运行期导入是为了避免 prompting ← scenarios ← prompting 的循环导入风险；
+    # 但**必须有**这条 TYPE_CHECKING 导入，否则 `"ScenarioProfile | None"` 是悬空引用，
+    # ruff F821 与 mypy 都会报，且 IDE 跳转失效。
+    from src.scenarios.base import ScenarioProfile
 
 # 匹配列定义行：允许行首缩进，行首是列名（跳过 PRIMARY KEY (...)、) 等约束行）
 _COL_RE = re.compile(r"^\s*(\w+)\s")

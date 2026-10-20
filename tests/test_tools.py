@@ -9,7 +9,6 @@
 
 运行：.venv/Scripts/python.exe -m pytest tests/test_tools.py -v
 """
-import json
 import os
 import sys
 from pathlib import Path

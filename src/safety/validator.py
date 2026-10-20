@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 
 import sqlparse
 from sqlparse.sql import Function, Identifier, IdentifierList, Parenthesis
-from sqlparse.tokens import Comment, Keyword, Name
+from sqlparse.tokens import Comment
 
 
 def _is_real_token(t) -> bool:

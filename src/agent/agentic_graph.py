@@ -34,7 +34,6 @@ from langgraph.graph import END, StateGraph
 
 from src.agent.nodes import _account_usage  # 复用 token 记账（跨节点单一实现）
 from src.agent.state import SQLAgentState
-from src.core.config import settings
 from src.core.cost import BudgetExceeded
 from src.core.llm import get_llm
 from src.scenarios import get_profile

@@ -258,7 +258,6 @@ def load_custom_tables() -> int:
     """服务启动时恢复历史导入的 CSV 表（注册信息落盘 data/db/custom_tables.json）。"""
     import json
     from pathlib import Path
-    from src.core.config import settings
     reg = Path(_settings_db_path()).parent / "custom_tables.json"
     if not reg.exists():
         return 0

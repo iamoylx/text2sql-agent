@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Annotated, Literal, TypedDict
+from typing import Literal, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.checkpoint.memory import MemorySaver

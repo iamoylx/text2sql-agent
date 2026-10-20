@@ -31,7 +31,6 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -194,6 +193,13 @@ def _ev(type_: str, **data: Any) -> dict:
 _WRITE_HINT_RE = re.compile(
     r"(插入|新增|添加|写入|录入|更新|修改|改成|改为|删除|删掉|清空|抹掉|去掉)"
 )
+# 注意 `{{schema}}` 的双花括号不是笔误：这是 f-string，`{{` 渲染成字面量 `{`，
+# 于是模板里留下的是 `{schema}` 占位符，由 build_write_proposal() 用
+# `.replace("{schema}", schema_block)` 在**运行时**填（那份 schema 依赖库的实际表）。
+# 写成单花括号 `{schema}` 会在**导入期**就被求值 → `NameError: name 'schema' is not defined`，
+# 整个 `src.api.server` 无法导入、服务端起不来。这个 bug 曾真实存在过一个版本
+# （场景包重构时误加 f 前缀），而**没有任何测试导入 server**，所以全套测试一直是绿的。
+# 现在由 tests/test_server_import.py 钉住。
 _WRITE_SYS_PROMPT = f"""你是数据分析库的写操作助手。用户提出了一个可能涉及数据变更（增/删/改）的请求。
 你的任务：判断意图并生成**提案 SQL**（{_PROFILE.dialect} 方言，当前库为 {_PROFILE.db_desc}）。
 
@@ -203,7 +209,7 @@ _WRITE_SYS_PROMPT = f"""你是数据分析库的写操作助手。用户提出�
 3. 只能操作下述业务表；严禁 DDL（CREATE/DROP/ALTER）。
 4. 不确定主键/具体值时，先用保守的 WHERE（宁可 0 行也不可误伤），并在 warn 里说明。
 
-{schema}
+{{schema}}
 
 只输出 JSON（不要代码块）：
 {{"intent": "write" 或 "read", "sql": "INSERT/UPDATE/DELETE 语句或空串", "warn": "给审批人看的风险说明"}}"""

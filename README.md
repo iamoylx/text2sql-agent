@@ -1,5 +1,7 @@
 # text2sql-agent — 面向业务取数的数据分析 Agent
 
+[![CI](https://github.com/iamoylx/text2sql-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/iamoylx/text2sql-agent/actions/workflows/ci.yml)
+
 > 自然语言 → SQL → 结果 → 图表的对话式取数系统。
 > **手写 LangGraph 状态图编排**（禁用 `create_react_agent`），四层只读安全，
 > 60 条金标评测集 + 自愈专项，FastAPI SSE 流式 + 玻璃拟态三栏前端。
@@ -60,12 +62,12 @@ system prompt，保证人人问出一致口径。
 | MCP 协议用例 | **35/35**（`RUN_SLOW=1`）/ 34 + 1 skip（默认） | S7：stdio/http 双传输回环 + 安全不旁路 + 第三方工具动态注册 + **子进程凭据白名单 7 条** + **凭据失败形态 11 条（含接线与反向对照）** + **启动期黑盒验收 3 条 + 入口不可绕过 2 条** |
 | 建库脚本用例 | 11/11 | `tests/test_init_db.py`：缺 CSV 时点名文件 + 指路 Kaggle（而非裸 `FileNotFoundError`） |
 | 控制台编码闸门 | 5/5 | `tests/test_output_encoding.py`：AST 扫描 print/raise/logging/exit，禁 emoji 与 `¥`(U+00A5)——cp936 编不了，`PYTHONIOENCODING=gbk` 下会崩 |
-| 服务层测试 | pytest **147 passed / 2 skipped**（默认口径）<br>`RUN_SLOW=1` + 配好凭据 → **149 passed / 0 skipped** | 工具双保险 + 安全层 + S9 写路径 + S8 Supervisor + S7 MCP + 场景包 + 成本计量 + 建库脚本 + 编码闸门 |
+| 服务层测试 | pytest **150 passed / 2 skipped**（默认口径）<br>`RUN_SLOW=1` + 配好凭据 → **152 passed / 0 skipped** | 工具双保险 + 安全层 + S9 写路径 + S8 Supervisor + S7 MCP + 场景包 + 成本计量 + 建库脚本 + 编码闸门 |
 
 **为什么会有 skip、以及为什么这个数必须可复现**：只有两条真实 LLM 用例会跳过
 （`tests/test_tools.py` 与 `tests/test_mcp.py` 各一条），它们由 `RUN_SLOW=1` **显式开关**控制，
 而不是「看谁机器上碰巧有 API key」——否则同一个仓库在别人机器上是 147/2、在我这儿是 149/0，
-简历写「147 passed」就说不清。现在的口径是：**默认（不带任何环境变量、不配任何 key）＝ 147 passed / 2 skipped，
+简历写「150 passed」就说不清。现在的口径是：**默认（不带任何环境变量、不配任何 key）＝ 150 passed / 2 skipped，
 任何机器一致**；要跑全量就 `RUN_SLOW=1`，且需配好凭据（未配则给一条点名变量的 skip，而不是红）。
 其余用例**零外部依赖**：不联网、不读凭据、不需要人工准备数据。
 
@@ -288,14 +290,46 @@ python scripts/run_api.py          # http://127.0.0.1:8501
 ### 6. 自检（不耗 LLM 额度）
 
 ```bash
-python -m pytest -q                # 默认 147 passed / 2 skipped，任何机器一致
+python -m pytest -q                # 默认 150 passed / 2 skipped
 python evals/run_eval_s5.py        # 60 条全量评测（需 LLM，约 ¥0.18）
 python evals/run_selfheal_eval.py  # 自愈专项（需 LLM，约 ¥0.04）
 ```
 
-> 为什么会有 2 个 skip：只有两条用例真调 LLM，由 `RUN_SLOW=1` 显式控制。
-> 默认口径下整套测试**零外部依赖**（不联网、不读凭据、不需准备数据），
-> 所以「147 passed / 2 skipped」在任何机器上都能复现。
+> **为什么会有 2 个 skip**：只有两条用例真调 LLM，由 `RUN_SLOW=1` 显式控制。
+> 默认口径不联网、不读凭据。
+>
+> **但默认口径**并非「不需准备数据」**——这一点之前写错了，已订正**：
+> 有 10 条用例要碰 `data/db/olist.db`（135 MB，由 Kaggle 数据集建出，`.gitignore` 排除）。
+> 所以准确说法是「任何**建过库**的机器上 150 / 2」。干净克隆实测是
+> **137 passed / 10 failed / 2 skipped**，10 条全因 `sqlite3.OperationalError`。
+>
+> CI 与干净克隆上用合成库补齐（表结构真实、行数合成，够跑通代码路径）：
+>
+> ```bash
+> python scripts/make_fixture_db.py     # 生成 data/db/olist.db（合成，约 22 MB / 2.4s）
+> python -m pytest -q                   # → 150 passed / 2 skipped
+> ```
+>
+> 真实业务基数由 `init_db.py` 的 `EXPECTED` 行数校验与 METRICS.md 负责，**不由单测负责**
+> ——单测该钉不变量，不该钉数据集基数（`test_safety.py` 里写死 `== 99441` 的那条已改）。
+
+### 7. 持续集成（GitHub Actions）
+
+[`ci.yml`](.github/workflows/ci.yml)：`ruff`（真实缺陷类规则）→ 生成合成 fixture 库 → `pytest`。
+推 main / PR 触发，约 4 分钟。
+
+**为什么要单独生成 fixture 库**：库文件不入库，CI 是干净环境。上面那 10 条失败的用例
+正是被 CI 的前置侦察（干净克隆）照出来的——CI 的价值在它建立之前就已经兑现过一次。
+
+本地复刻 CI：
+
+```bash
+python -m venv /tmp/ci && /tmp/ci/bin/pip install -r requirements.txt ruff
+/tmp/ci/bin/python scripts/make_fixture_db.py && /tmp/ci/bin/python -m pytest -q
+```
+
+> **别在本地随便跑 `make_fixture_db.py`**：它会写 `data/db/olist.db`，
+> 覆盖掉你的真实库（脚本默认拒绝覆盖，除非加 `--force`）。
 
 ### 常见卡点
 

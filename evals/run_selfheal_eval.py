@@ -34,8 +34,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.agent import nodes  # noqa: E402
-from src.agent.fewshot import FewShotRetriever  # noqa: E402
-from src.agent.prompting import build_system_prompt, render_fewshots_block, render_schema_block  # noqa: E402
 from src.core.config import settings  # noqa: E402
 from src.core.cost import CostTracker  # noqa: E402
 from src.safety.validator import execute_with_timeout  # noqa: E402
