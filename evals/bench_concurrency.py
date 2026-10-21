@@ -454,18 +454,17 @@ def cmd_e2e(a) -> int:
     print(f"SQL 命中他人金标（串场）：{len(foreign)} 处"
           + (f"  -> {foreign[:3]}" if foreign else "  [OK] 0 串场"))
     _warn_if_weak(own, len(records))
-    if a.strict:
-        _strict_check(records, items)
-        strict_foreign = strict_crosstalk(records, items)
-        print(f"[严格] 结果集交叉矩阵命中他人金标（串场）：{len(strict_foreign)} 处"
-              + (f"  -> {strict_foreign[:5]}" if strict_foreign else "  [OK] 0 串场"))
-        _report_power(records)
-        foreign = strict_foreign or foreign
+    strict = strict_report(records, items, own) if a.strict else _strict_skipped()
+    foreign = strict["strict_foreign_hits"] or foreign
     print(f"E 路径  -> {md_row('P2-E 全链路', len(records), a.conc, s, _guess_e(records))}")
     _save("E", a.tag, {"meta": _meta(a, url), "summary": s,
                        "statuses": statuses, "own_sql_hit": own,
-                       "foreign_hits": foreign, "records": records})
-    ok = s["err_rate"] is not None and s["err_rate"] <= 0.05 and not foreign
+                       "foreign_hits": foreign, "strict": strict,
+                       "records": records})
+    # 只有「严格口径自证有区分力且 0 串场」才算通过；
+    # `unsupported` / `blind` 时 foreign 为空是**测不出来**，不能算通过。
+    ok = (s["err_rate"] is not None and s["err_rate"] <= 0.05
+          and not foreign and strict["detector_power"] == "ok")
     return 0 if ok else 1
 
 
@@ -484,17 +483,16 @@ def cmd_crosstalk(a) -> int:
     print(f"命中他人金标（串场）：{len(foreign)} 处"
           + (f"  -> {foreign[:5]}" if foreign else "  [OK] 0 串场"))
     _warn_if_weak(own, len(records))
-    if a.strict:
-        _strict_check(records, items)
-        strict_foreign = strict_crosstalk(records, items)
-        print(f"[严格] 结果集交叉矩阵命中他人金标（串场）：{len(strict_foreign)} 处"
-              + (f"  -> {strict_foreign[:5]}" if strict_foreign else "  [OK] 0 串场"))
-        _report_power(records)
-        foreign = strict_foreign or foreign
+    strict = strict_report(records, items, own) if a.strict else _strict_skipped()
+    foreign = strict["strict_foreign_hits"] or foreign
     _save("crosstalk", a.tag, {"meta": _meta(a, url), "summary": s,
                                "own_sql_hit": own, "foreign_hits": foreign,
-                               "records": records})
-    return 0 if not foreign else 3
+                               "strict": strict, "records": records})
+    if foreign:
+        return 3
+    # 0 串场 + 检测器无区分力 = 没结论。退出码分开编（3=真串场，5=没测出来），
+    # 注意 main() 里服务不可达也用 4，所以这里不能用 4，否则脚本化时无法区分。
+    return 0 if strict["detector_power"] == "ok" else 5
 
 
 def cmd_ramp(a) -> int:
@@ -547,6 +545,31 @@ def cmd_ramp(a) -> int:
 # ============================================================================
 # 辅助
 # ============================================================================
+# 单条 SQL 的执行上限（秒）。候选 SQL 来自模型，可能写出笛卡尔积；
+# 没有这个上限时，一条病态 SQL 就能把整轮压测挂死。
+SQL_TIMEOUT_S = 8.0
+# 交叉矩阵的规模上限：矩阵本身是内存比较，但 2N 条 SQL 要真执行。
+# 超过这个 N 就跳过矩阵，并在 artifact 里写明「跳过了」，不伪装成「没问题」。
+XMATRIX_MAX = 24
+
+# `evals/run_eval_s5` 模块的惰性加载缓存：{"mod": module|None, "err": str|None}
+_S5_CACHE: dict = {}
+# SQL 文本 -> ("ok", 规范化结果集) | ("err", 错误串)。见 `_canon_sql()` 的说明。
+_SQL_CACHE: dict = {}
+
+
+def _canon_rows(rows, norm_val, cmp_key) -> list:
+    """把结果集规范化成可比较的形态：行内排序 + 行间排序，浮点 round 2。
+
+    这段与 `run_eval_s5.compare_result()` 里的 `canon()` 必须逐字一致，
+    否则两个口径会悄悄分叉。因此它不自己发明规则，而是**向 s5 模块借用**
+    `_norm_val` / `_cmp_key`；`tests/test_bench_concurrency.py` 里有一条
+    交叉验证用例，拿真实 `compare_result()` 对同一批 SQL 断言结论相同。
+    """
+    inner = [tuple(sorted(r, key=cmp_key)) for r in rows]
+    return sorted(inner, key=lambda row: tuple(cmp_key(v) for v in row))
+
+
 def _sql_crosstalk(records: list[dict], items: list[dict]) -> tuple[int, list]:
     """交叉比对：这条响应的 SQL 是否命中**自己**的金标、是否命中**别人**的金标。
 
@@ -570,35 +593,200 @@ def _sql_crosstalk(records: list[dict], items: list[dict]) -> tuple[int, list]:
     return own, foreign
 
 
-def _report_power(records: list[dict]) -> None:
-    """把「检测器有没有区分力」变成可证的事实，而不是一句自说自话。
+def strict_report(records: list[dict], items: list[dict], text_own: int) -> dict:
+    """执行级严格校验 —— **结构化落盘**，让 artifact 自己证明结论。
 
-    交叉矩阵说「没命中他人金标」时，读者无法判断这是「真的没串场」还是
-    「检测器瞎了」。所以同时报「命中自己金标」的数量：
-    自己都命中不了，就别拿「没命中别人」当结论。
+    ## 为什么必须落盘
+
+    「0 串场」只有在**检测器有区分力**时才是结论。区分力 = 检测器能把这条响应
+    认回它自己的金标。此前 JSON 里只存了**文本级** `own_sql_hit`（实测 0/20），
+    于是从 artifact 完全看不出严格口径下命中了自己几次 ——
+    「0 串场」既不可复现，也无法被反驳。这里把两个口径并排落盘：
+
+    | 键 | 含义 |
+    |---|---|
+    | `text_own_hit` | 归一化 SQL 文本精确命中自己金标（弱检测器） |
+    | `strict_own_hit` | 执行结果集命中自己金标（强检测器） |
+    | `strict_foreign_hits` | 执行结果集命中**他人**金标（串场，阻断级） |
+
+    判据（写进 `detector_power`）：
+
+    - `ok`：`strict_own_hit > 0` → 强检测器看得见，`0 串场` 可信；
+    - `blind`：装载成功但 `strict_own_hit == 0` → 连自己都认不出，
+      `0 串场` **不可作为结论**；
+    - `unsupported`：`compare_result` 没装起来（缺 fixture 库等）→
+      这一轮**没有**严格证据，不能拿 `0 串场` 说事。
+
+    最后一条是这次补落盘时最容易被忽略的：把「没测」和「测了没问题」
+    混成一个 0，正是审计时最容易被打回的地方。
     """
+    _strict_check(records, items)                 # 写 rec["strict_ok"] / ["strict_detail"]
     scored = [r for r in records if "strict_ok" in r]
-    if not scored:
-        return
     own = sum(1 for r in scored if r["strict_ok"])
-    verdict = "有区分力" if own else "**无区分力，串场结论不成立**"
-    print(f"[严格] 区分力自证：命中自己金标 {own}/{len(scored)} -> {verdict}")
+    supported = _load_s5() is not None
+
+    unscored = [
+        {"qid": r.get("qid"),
+         "reason": "无 SQL" if not r.get("sql") else "无金标"}
+        for r in records if "strict_ok" not in r
+    ]
+    if not supported:
+        power = "unsupported"
+        why = f"compare_result 装载失败（{_S5_CACHE.get('err')}），本轮无严格证据"
+    elif own == 0:
+        power = "blind"
+        why = "执行级比对连自己的金标都命中不了，串场结论不成立"
+    else:
+        power = "ok"
+        why = "执行级比对能认回自己的金标，具备区分力"
+
+    # 交叉矩阵：规模超限就**明说跳过**。绝不能让「没做」在 JSON 里长得像「没问题」。
+    if not supported:
+        foreign, degenerate, x_skip = [], [], "compare_result 不可用，矩阵未执行"
+    elif len(records) > XMATRIX_MAX:
+        foreign, degenerate, x_skip = [], [], (
+            f"N={len(records)} > XMATRIX_MAX={XMATRIX_MAX}，"
+            f"交叉矩阵未执行（0 串场仅覆盖自己→自己）")
+    else:
+        (foreign, degenerate), x_skip = strict_crosstalk(records, items), None
+    report = {
+        "text_own_hit": text_own,
+        "text_own_rate": _r(text_own / len(records)) if records else None,
+        "text_detector_has_power": bool(text_own),
+        "strict_own_hit": own,
+        "strict_scored": len(scored),
+        "strict_own_rate": _r(own / len(scored)) if scored else None,
+        "strict_foreign_hits": [list(p) for p in foreign],
+        "strict_foreign_count": len(foreign),
+        # 「看起来像串场但值退化为 0/NULL/空集」的匹配：不计入串场，但留痕。
+        # 见 `_is_degenerate()`：不同问题同答 0 是语义正确，不是串场。
+        "strict_degenerate_matches": [list(p) for p in degenerate],
+        "strict_degenerate_count": len(degenerate),
+        "strict_unscored": unscored,
+        "strict_xmatrix_skipped": x_skip,
+        "detector_power": power,
+        "detector_power_reason": why,
+        "conclusion": (
+            f"严格口径：命中自己 {own}/{len(scored)}，命中他人 {len(foreign)} 处"
+            + (f"（另有 {len(degenerate)} 处同值匹配因结果集退化被排除）"
+               if degenerate else "")
+            + (f"（矩阵未执行：{x_skip}）" if x_skip else "")
+            + f"；检测器 {power}（{why}）"
+        ),
+    }
+    print(f"[严格] 结果集语义比对通过（命中自己金标）：{own}/{len(scored)}")
+    if x_skip:
+        print(f"[严格] 交叉矩阵跳过：{x_skip}")
+    else:
+        print(f"[严格] 结果集交叉矩阵命中他人金标（串场）：{len(foreign)} 处"
+              + (f"  -> {foreign[:5]}" if foreign else "  [OK] 0 串场"))
+        if degenerate:
+            print(f"[严格] 另有 {len(degenerate)} 处同值匹配因结果集退化"
+                  f"（0/NULL/空集）被排除，不计为串场：{degenerate[:5]}")
+    print(f"[严格] 区分力：{power} —— {why}")
+    return report
 
 
-def _load_compare():
-    """惰性加载 `evals/run_eval_s5.compare_result`（执行级结果集比对）。"""
+def _load_s5():
+    """惰性加载 `evals/run_eval_s5` 模块（执行级比对的家）。
+
+    返回**模块**而不只是 `compare_result`：执行级比对需要一套归一化函数
+    （`_norm_val` / `_cmp_key` / `DB`），借用的必须与官方评测器**同一份**，
+    否则两处口径会分叉而没人发现。
+
+    缓存同时让 `strict_report` 能区分「检测器瞎了」（`blind`）和
+    「检测器根本没装上」（`unsupported`）——这两件事的结论完全不同。
+    """
+    if "mod" in _S5_CACHE:
+        return _S5_CACHE["mod"]
+    mod, err = None, None
     try:
         spec = importlib.util.spec_from_file_location(
             "run_eval_s5", ROOT / "evals" / "run_eval_s5.py")
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        return mod.compare_result
     except Exception as e:                        # noqa: BLE001
-        print(f"[WARN] compare_result 不可用：{type(e).__name__}: {e}")
-        return None
+        err = f"{type(e).__name__}: {e}"
+        print(f"[WARN] compare_result 不可用：{err}")
+    _S5_CACHE["mod"], _S5_CACHE["err"] = mod, err
+    return mod
 
 
-def strict_crosstalk(records: list[dict], items: list[dict]) -> list[tuple[str, str]]:
+def _is_degenerate(canon) -> bool:
+    """结果集是否退化到「不能当指纹」：空集，或只有 0 / NULL / 空串。
+
+    ## 为什么必须单独判
+
+    实测（`--path e`，22 条）：交叉矩阵报出 4 处「串场」，全部来自 f02
+    `(0,)` 与 a06 `(0.0,)` / e01 `(0,)` / e03 `(0,)` / e04 `(0,)` 相等。
+    但 f02 的 SQL 是**对的**（`strict_ok=True`），它问的「2018 年 10 月已送达
+    订单数」在这份 fixture 里真就是 0；而那四题问的也是「有多少笔」，
+    金标同样是 0。
+
+    **不同问题答出同一个 0 是语义正确，不是串场。** 一个退化值不携带任何
+    区分信息，拿它当指纹必然误报——这跟「0/20 的文本检测器没有区分力」
+    是同一类错误，只是发生在**值**这一层而不是检测器层。
+
+    所以：退化匹配不计入串场，但也不丢弃，单独落盘供人复核。
+    """
+    if not canon:
+        return True
+    for row in canon:
+        for v in row:
+            if isinstance(v, str):
+                if v.strip() != "":
+                    return False
+            elif v not in (0, 0.0, None):
+                return False
+    return True
+
+
+def _canon_sql(mod, sql: str) -> tuple[str, object]:
+    """执行一条 SQL 并返回 `("ok", 规范化结果集)` 或 `("err", 错误串)`，**按 SQL 文本缓存**。
+
+    ## 为什么要缓存：不缓存就是 O(N^2) 次昂贵执行
+
+    原实现直接调 `compare_result(gold_j, cand_i)` 做交叉矩阵，于是**同一条候选 SQL
+    会被重复执行 N 次**。实测这套 fixture 库的金标本身就不便宜——22 条 gold 自比对
+    要 37.9 秒（m07 6.9s / m02 6.2s / m08 5.4s），乘上 22×21 的矩阵就是十几分钟，
+    看起来像「卡死」，其实是二次方成本撞上了慢查询。
+
+    按 SQL 文本缓存之后，**每条不同的 SQL 只执行一次**：N 条金标 + N 条候选 = 2N 次，
+    矩阵比对退化成内存里的集合比较。
+
+    ## 为什么要有超时
+
+    候选 SQL 来自模型，可能写出笛卡尔积。`sqlite3` 的 progress handler 让它在
+    `sql_timeout` 秒时中断并返回错误，而不是把整轮压测挂死。
+    """
+    if sql in _SQL_CACHE:
+        return _SQL_CACHE[sql]
+    import sqlite3
+
+    deadline = time.monotonic() + SQL_TIMEOUT_S
+    try:
+        con = sqlite3.connect(f"file:{mod.DB}?mode=ro", uri=True)
+    except Exception as e:                        # noqa: BLE001
+        res: tuple[str, object] = ("err", f"DB_ERR {type(e).__name__}: {str(e)[:80]}")
+        _SQL_CACHE[sql] = res
+        return res
+    try:
+        # 每 20000 条 vm 指令查一次墙钟；返回非 0 即中断
+        con.set_progress_handler(
+            lambda: 1 if time.monotonic() > deadline else 0, 20000)
+        rows = con.execute(sql).fetchall()
+        res = ("ok", _canon_rows(rows, mod._norm_val, mod._cmp_key))
+    except Exception as e:                        # noqa: BLE001
+        res = ("err", f"{type(e).__name__}: {str(e)[:80]}")
+    finally:
+        con.close()
+    _SQL_CACHE[sql] = res
+    return res
+
+
+def strict_crosstalk(records: list[dict],
+                     items: list[dict]) -> tuple[list[tuple[str, str]],
+                                                 list[tuple[str, str]]]:
     """执行级交叉矩阵：存在 i != j 使得 record_i 的 SQL 结果集 == gold_j 的结果集。
 
     ## 为什么归一化 SQL 比对对 P2 没用
@@ -609,27 +797,61 @@ def strict_crosstalk(records: list[dict], items: list[dict]) -> list[tuple[str, 
     在 0/20 的检测器上，「没有命中他人金标」几乎恒成立——
     那不是「没有串场」，是**检测器看不见**。用结果集比对才有区分力。
 
-    代价：O(N^2) 次 SQL 执行，只适合小的 N（crosstalk 阶段 5-10 条）。
+    代价：每轮要执行 2N 条**不同**的 SQL（金标 + 候选，各只执行一次），
+    再在内存里做 N^2 比较。这套 fixture 库的单条金标 SQL 就不便宜
+    （22 条里 m07 6.9s、m02 6.2s），所以 N 仍是有限制的：
+    `--xmatrix-max` 之外的 N 会跳过矩阵并在 artifact 里写明跳过了，
+    **不允许「没做」和「做了没问题」在 JSON 里长得一样**。
+    返回 `(真串场, 因结果集退化而被排除的匹配)`。第二项不是噪声——
+    它把「看起来像串场但值不携带信息」的情况显式留痕，便于人工复核。
     """
-    compare = _load_compare()
-    if compare is None:
-        return []
+    mod = _load_s5()
+    if mod is None:
+        return [], []
     gold = {it["id"]: it.get("gold_sql", "") for it in items}
+    # 先各算一次规范化结果集（2N 次执行，且被 `_canon_sql` 缓存），
+    # 再在内存里做 N^2 比较 —— 而不是执行 N^2 次 SQL。
+    gold_canon = {k: _canon_sql(mod, v) for k, v in gold.items() if v}
     hits: list[tuple[str, str]] = []
+    degenerate: list[tuple[str, str]] = []
     for rec in records:
         cand = rec.get("sql")
         if not cand:
             continue
-        for other_id, other_gold in gold.items():
-            if other_id == rec["qid"] or not other_gold:
+        c_state, c_val = _canon_sql(mod, cand)
+        if c_state != "ok":
+            continue
+        for other_id, (g_state, g_val) in gold_canon.items():
+            if other_id == rec["qid"] or g_state != "ok":
                 continue
-            try:
-                ok, _ = compare(other_gold, cand)
-            except Exception:                     # noqa: BLE001
+            if c_val != g_val:
                 continue
-            if ok:
+            # 双方任一退化（0 / NULL / 空集）就不算证据
+            if _is_degenerate(c_val) or _is_degenerate(g_val):
+                degenerate.append((rec["qid"], other_id))
+            else:
                 hits.append((rec["qid"], other_id))
-    return hits
+    return hits, degenerate
+
+
+def _strict_skipped() -> dict:
+    """`--no-strict` 时落盘的占位结构。
+
+    故意写成 `detector_power="unsupported"` 而不是省略整个键：
+    只要 artifact 里出现过「0 串场」，就必须能查到当时用的是哪个口径，
+    否则下次有人翻到这份 JSON 会以为严格口径也验过了。
+    """
+    return {
+        "text_own_hit": None, "text_own_rate": None,
+        "text_detector_has_power": None,
+        "strict_own_hit": None, "strict_scored": 0, "strict_own_rate": None,
+        "strict_foreign_hits": [], "strict_foreign_count": 0,
+        "strict_degenerate_matches": [], "strict_degenerate_count": 0,
+        "strict_unscored": [], "strict_xmatrix_skipped": "本轮未做严格口径复核",
+        "detector_power": "unsupported",
+        "detector_power_reason": "--no-strict：本轮未做执行级复核，0 串场无严格证据",
+        "conclusion": "本轮未做严格口径复核（--no-strict）",
+    }
 
 
 def _warn_if_weak(own: int, n: int) -> None:
@@ -641,7 +863,7 @@ def _warn_if_weak(own: int, n: int) -> None:
     """
     if n and own / n < 0.3:
         print(f"[WARN] 区分力不足：仅 {own}/{n} 命中自己金标，"
-              f"此时「0 串场」不可作为结论。改用 --strict（执行级结果集比对）复核。")
+              f"此时「0 串场」不可作为结论。以 --strict（执行级结果集比对，默认开）为准。")
 
 
 def _strict_check(records: list[dict], items: list[dict]) -> None:
@@ -650,25 +872,27 @@ def _strict_check(records: list[dict], items: list[dict]) -> None:
     故意做成可选：它要连 fixture 库、每条执行两次 SQL，是「最终报告」用的强断言，
     不适合塞进快速骨架自检。导入失败只告警，不打断——压测不该被评测器拖死。
     """
-    try:
-        spec = importlib.util.spec_from_file_location(
-            "run_eval_s5", ROOT / "evals" / "run_eval_s5.py")
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-    except Exception as e:                        # noqa: BLE001
-        print(f"[WARN] compare_result 不可用，跳过严格比对：{type(e).__name__}: {e}")
+    mod = _load_s5()
+    if mod is None:
+        print("[WARN] compare_result 不可用，跳过严格比对")
         return
     gold = {it["id"]: it.get("gold_sql", "") for it in items}
-    hit = 0
     for rec in records:
         g, c = gold.get(rec["qid"]), rec.get("sql")
         if not g or not c:
             continue
-        ok, detail = mod.compare_result(g, c)
-        rec["strict_ok"] = bool(ok)
-        rec["strict_detail"] = detail
-        hit += 1 if ok else 0
-    print(f"[严格] 结果集语义比对通过：{hit}/{len(records)}")
+        g_state, g_val = _canon_sql(mod, g)
+        if g_state != "ok":
+            rec["strict_ok"] = False
+            rec["strict_detail"] = f"GOLD_ERR {g_val}"
+            continue
+        c_state, c_val = _canon_sql(mod, c)
+        if c_state != "ok":
+            rec["strict_ok"] = False
+            rec["strict_detail"] = f"EXEC_ERR {c_val}"
+            continue
+        rec["strict_ok"] = bool(c_val == g_val)
+        rec["strict_detail"] = "" if rec["strict_ok"] else "结果集不一致"
 
 
 def _guess_d(s: dict) -> str:
@@ -730,15 +954,24 @@ def build_parser() -> argparse.ArgumentParser:
                    help="ramp 里 /api/query 的并发档位（每条一次 LLM，慎加）")
     p.add_argument("--query-n", type=int, default=5, help="ramp 里每档 query 条数")
     p.add_argument("--timeout", type=float, default=180.0)
-    p.add_argument("--strict", action="store_true",
+    p.add_argument("--no-strict", dest="strict", action="store_false",
+                   help="关掉执行级复核（默认开：0 串场必须有区分力自证才作数）")
+    p.add_argument("--strict", action="store_true", default=True,
                    help="用 compare_result 做执行级结果集比对（要连 fixture 库）")
+    p.add_argument("--sql-timeout", type=float, default=SQL_TIMEOUT_S,
+                   help="严格比对时单条 SQL 的执行上限（秒），防止病态 SQL 挂死压测")
+    p.add_argument("--xmatrix-max", type=int, default=XMATRIX_MAX,
+                   help="交叉矩阵的规模上限（要真执行 2N 条 SQL），超过则跳过并落盘说明")
     p.add_argument("--tag", default="")
     p.add_argument("--dry-run", action="store_true")
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
+    global SQL_TIMEOUT_S, XMATRIX_MAX
     a = build_parser().parse_args(argv)
+    SQL_TIMEOUT_S = a.sql_timeout
+    XMATRIX_MAX = a.xmatrix_max
     defaults = {"d": (300, 10), "e": (20, 2), "crosstalk": (5, 5), "ramp": (60, 2)}
     dn, dc = defaults[a.path]
     if a.n <= 0:

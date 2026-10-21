@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -328,3 +329,240 @@ def test_cli_help_is_wellformed_and_needs_no_server():
     assert ei.value.code == 0
     with pytest.raises(SystemExit):
         bench.build_parser().parse_args(["--path", "nonexistent"])
+
+
+# ============================================================================
+# 严格口径落盘：让「0 串场」变成 artifact 可复现的结论
+# ============================================================================
+@pytest.fixture
+def tiny_s5(tmp_path):
+    """把**真实** `run_eval_s5` 的 DB 指向一个临时小库。
+
+    刻意不自己做一套假比对：`_canon_rows()` 复刻了官方 `canon()` 的排序规则，
+    两者分叉就会静默给出不同结论。所以这里用真的 `_norm_val` / `_cmp_key` /
+    `compare_result`，只换库路径 —— 既能跑得飞快，又能交叉验证两者等价。
+
+    必须挂快照 fixture：`_S5_CACHE` / `_SQL_CACHE` 都是模块级全局，
+    污染会静默影响后面所有用例（本仓库为「全局状态被污染」单独踩过坑）。
+    """
+    mod = bench._load_s5()
+    if mod is None:
+        pytest.skip("run_eval_s5 不可用")
+
+    db = tmp_path / "tiny.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE t (k TEXT, v REAL)")
+    con.executemany("INSERT INTO t VALUES (?,?)",
+                    [("a", 1.0), ("b", 2.0), ("c", 3.0)])
+    con.commit()
+    con.close()
+
+    old_db = mod.DB
+    saved_sql = dict(bench._SQL_CACHE)
+    mod.DB = db
+    bench._SQL_CACHE.clear()
+    try:
+        yield mod
+    finally:
+        mod.DB = old_db
+        bench._SQL_CACHE.clear()
+        bench._SQL_CACHE.update(saved_sql)
+
+
+def _items(*ks):
+    return [{"id": k, "gold_sql": f"SELECT v FROM t WHERE k = '{k}'"} for k in ks]
+
+
+def _records(*ks):
+    """候选 SQL 故意与金标文本不同：小写、多空格、带尾分号。
+
+    真实 P2 里 `_norm_sql` 精确匹配命中自己 **0/22**，就是这种程度差异造成的。
+    """
+    return [{"qid": k, "sql": f"select   v  from t where k='{k}';"} for k in ks]
+
+
+def test_canon_rows_agrees_with_official_compare_result(tiny_s5):
+    """**交叉验证**：`_canon_sql` 的判定必须与官方 `compare_result` 完全一致。
+
+    这是复刻 `canon()` 唯一的保险。列序/行序/浮点 round 任何一处走样，
+    这里的 True/False 就会对不上。
+    """
+    pairs = [
+        ("SELECT v FROM t WHERE k='a'", "select   v  from t where k='a';"),
+        ("SELECT v FROM t WHERE k='a'", "SELECT v FROM t WHERE k='b'"),
+        ("SELECT v FROM t WHERE k='a'", "SELECT sum(v) FROM t"),
+        ("SELECT v FROM t",             "SELECT v FROM t ORDER BY v DESC"),
+        ("SELECT v, k FROM t",          "SELECT k, v FROM t"),   # 列序不同
+        ("SELECT round(v, 4) FROM t WHERE k='a'", "SELECT v FROM t WHERE k='a'"),
+    ]
+    for gold, cand in pairs:
+        official, _ = tiny_s5.compare_result(gold, cand)
+        g_state, g_val = bench._canon_sql(tiny_s5, gold)
+        c_state, c_val = bench._canon_sql(tiny_s5, cand)
+        mine = (g_state == "ok" and c_state == "ok" and g_val == c_val)
+        assert mine == official, f"口径分叉：{gold!r} vs {cand!r}"
+
+
+def test_strict_report_records_own_hits_despite_text_mismatch(tiny_s5):
+    """文本级 0/3、执行级 3/3 —— 两个口径必须同时落盘，否则看不出差别。"""
+    rep = bench.strict_report(_records("a", "b", "c"), _items("a", "b", "c"),
+                             text_own=0)
+    assert rep["text_own_hit"] == 0
+    assert rep["strict_own_hit"] == 3
+    assert rep["strict_scored"] == 3
+    assert rep["strict_own_rate"] == 1.0
+    assert rep["detector_power"] == "ok"
+    assert rep["strict_foreign_count"] == 0
+    assert rep["strict_xmatrix_skipped"] is None
+
+
+def test_strict_report_blind_detector_is_marked_not_silently_zero(tiny_s5):
+    """**决定性断言**：检测器失明时，`0 串场` 必须被判为「不可作结论」。
+
+    只断言 `foreign == 0` 是单边的：一个永远认不出任何东西的检测器也能过。
+    """
+    blind = [{"qid": "a", "sql": "SELECT v FROM t WHERE k='zzz'"}]
+    rep = bench.strict_report(blind, _items("a"), text_own=0)
+    assert rep["strict_own_hit"] == 0
+    assert rep["strict_foreign_count"] == 0          # 看起来「0 串场」
+    assert rep["detector_power"] == "blind"          # 但结论是「测不出来」
+    assert "不成立" in rep["detector_power_reason"]
+
+
+def test_strict_report_unsupported_differs_from_blind(tiny_s5):
+    """「没测」和「测了没问题」必须分开：装载失败要落成 unsupported。"""
+    saved = dict(bench._S5_CACHE)
+    bench._S5_CACHE.clear()
+    bench._S5_CACHE.update({"mod": None, "err": "ModuleNotFoundError: 缺库"})
+    try:
+        rep = bench.strict_report(_records("a"), _items("a"), text_own=0)
+    finally:
+        bench._S5_CACHE.clear()
+        bench._S5_CACHE.update(saved)
+    assert rep["detector_power"] == "unsupported"
+    assert "装载失败" in rep["detector_power_reason"]
+    assert "矩阵未执行" in rep["strict_xmatrix_skipped"]
+    assert [u["qid"] for u in rep["strict_unscored"]] == ["a"]
+
+
+def test_strict_report_foreign_hit_is_saved_as_pair(tiny_s5):
+    """串场要落成 (提问者, 被抄者) 二元组，只存个数查不出是哪两条。"""
+    recs = [{"qid": "a", "sql": "SELECT v FROM t WHERE k='b'"}]   # a 拿到 b 的结果
+    rep = bench.strict_report(recs, _items("a", "b"), text_own=0)
+    assert rep["strict_own_hit"] == 0
+    assert rep["strict_foreign_hits"] == [["a", "b"]]
+    assert rep["strict_foreign_count"] == 1
+
+
+def test_strict_report_records_scored_denominator(tiny_s5):
+    """没 SQL 的记录不能算进分母，否则通过率会被稀释成假的好看。"""
+    recs = _records("a") + [{"qid": "b", "sql": ""}]
+    rep = bench.strict_report(recs, _items("a", "b"), text_own=0)
+    assert rep["strict_own_hit"] == 1
+    assert rep["strict_scored"] == 1                 # 不是 2
+    assert rep["strict_own_rate"] == 1.0
+    assert rep["strict_unscored"] == [{"qid": "b", "reason": "无 SQL"}]
+
+
+def test_xmatrix_executes_each_distinct_sql_only_once(tiny_s5, monkeypatch):
+    """**决定性断言**：交叉矩阵不能是 N^2 次 SQL 执行。
+
+    原实现对每个 (候选, 他人金标) 组合都调一次 `compare_result`，
+    于是同一条候选 SQL 被重复执行 N 次。实测这套 fixture 库 22 条金标自比对
+    要 37.9 秒，乘上 22x21 就是十几分钟 —— 表现为「压测卡死」。
+    按 SQL 文本缓存后，执行次数应为 2N（N 条金标 + N 条候选）。
+    """
+    calls = {"n": 0}
+    real_connect = sqlite3.connect
+
+    def counting(*a, **kw):
+        calls["n"] += 1
+        return real_connect(*a, **kw)
+
+    monkeypatch.setattr(sqlite3, "connect", counting)
+    bench._SQL_CACHE.clear()
+    hits, degenerate = bench.strict_crosstalk(
+        _records("a", "b", "c"), _items("a", "b", "c"))
+    assert hits == [] and degenerate == []
+    # 3 金标 + 3 候选 = 6；若没缓存，会是 3 金标 x 3 候选 = 9 次
+    assert calls["n"] == 6, f"执行了 {calls['n']} 次 SQL，缓存失效"
+
+
+def test_canon_sql_times_out_instead_of_hanging(tiny_s5, monkeypatch):
+    """病态 SQL 必须被超时打断，而不是把整轮压测挂死。"""
+    monkeypatch.setattr(bench, "SQL_TIMEOUT_S", 0.2)
+    state, val = bench._canon_sql(
+        tiny_s5,
+        "WITH RECURSIVE r(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM r"
+        " WHERE i < 500000000) SELECT count(*) FROM r")
+    assert state == "err"
+    assert "interrupt" in str(val).lower()
+
+
+def test_xmatrix_is_skipped_and_declared_when_too_large(tiny_s5, monkeypatch):
+    """规模超限时跳过矩阵，但必须在 artifact 里写明跳过了。"""
+    monkeypatch.setattr(bench, "XMATRIX_MAX", 1)
+    rep = bench.strict_report(_records("a", "b"), _items("a", "b"), text_own=0)
+    assert rep["strict_own_hit"] == 2                # 自比对仍然做了
+    assert rep["strict_foreign_count"] == 0
+    assert rep["strict_xmatrix_skipped"] is not None
+    assert "XMATRIX_MAX" in rep["strict_xmatrix_skipped"]
+    assert "矩阵未执行" in rep["conclusion"]
+
+
+def test_strict_skipped_declares_no_evidence():
+    """`--no-strict` 落盘的占位块不能长得像「验过了」。"""
+    rep = bench._strict_skipped()
+    assert rep["detector_power"] == "unsupported"
+    assert rep["strict_own_hit"] is None
+    assert "0 串场无严格证据" in rep["detector_power_reason"]
+    assert rep["strict_xmatrix_skipped"]
+
+
+def test_cli_strict_is_on_by_default_and_bounded():
+    """严格口径默认开；且默认带上 SQL 超时与矩阵上限（否则慢查询会挂死压测）。"""
+    a = bench.build_parser().parse_args(["--path", "crosstalk"])
+    assert a.strict is True
+    assert a.sql_timeout == bench.SQL_TIMEOUT_S and a.sql_timeout > 0
+    assert a.xmatrix_max == bench.XMATRIX_MAX and a.xmatrix_max > 0
+    assert bench.build_parser().parse_args(
+        ["--path", "crosstalk", "--no-strict"]).strict is False
+
+
+def test_degenerate_result_sets_are_not_counted_as_crosstalk(tiny_s5):
+    """**决定性断言（来自真实误报）**：同答一个 0 不算串场。
+
+    实测现场：`--path e` 22 条里交叉矩阵报出 4 处串场，全部是 f02 `(0,)`
+    与 a06 `(0.0,)` / e01 `(0,)` / e03 `(0,)` / e04 `(0,)` 相等。
+    但 f02 的 SQL 是对的——它问「2018 年 10 月已送达订单数」，fixture 里真是 0；
+    那四题问的也是「有多少笔」，金标同样 0。**不同问题同答 0 是语义正确。**
+
+    这里把该现场压成小库：`k='zzz'` 与 `k='none'` 两问的答案都是空集/0。
+    """
+    assert bench._is_degenerate([]) is True
+    assert bench._is_degenerate([(0,)]) is True
+    assert bench._is_degenerate([(0.0,)]) is True
+    assert bench._is_degenerate([(None,)]) is True
+    assert bench._is_degenerate([("",)]) is True
+    assert bench._is_degenerate([(1,)]) is False
+    assert bench._is_degenerate([(0, 5)]) is False       # 有一个非 0 就有信息
+    assert bench._is_degenerate([("2024-01-01",)]) is False
+
+    recs = [{"qid": "x", "sql": "SELECT COUNT(*) FROM t WHERE k='zzz'"}]
+    items = [{"id": "x", "gold_sql": "SELECT COUNT(*) FROM t WHERE k='x'"},
+             {"id": "y", "gold_sql": "SELECT COUNT(*) FROM t WHERE k='y'"}]
+    rep = bench.strict_report(recs, items, text_own=0)
+    assert rep["strict_foreign_count"] == 0              # 0 撞 0 不算串场
+    # 矩阵只比「自己 vs 别人」，所以 x 只与 y 撞一次；但这一处必须留痕
+    assert rep["strict_degenerate_matches"] == [["x", "y"]]
+    assert "退化" in rep["conclusion"]
+
+
+def test_real_valued_collision_is_still_reported(tiny_s5):
+    """反向对照：值不退化时，真的同值必须照报——不能把过滤器做成开关。"""
+    recs = [{"qid": "x", "sql": "SELECT COUNT(*) FROM t WHERE k='a'"}]
+    items = [{"id": "x", "gold_sql": "SELECT COUNT(*) FROM t WHERE k='b'"},
+             {"id": "y", "gold_sql": "SELECT COUNT(*) FROM t WHERE k='b'"}]
+    rep = bench.strict_report(recs, items, text_own=0)
+    assert rep["strict_foreign_hits"] == [["x", "y"]]
+    assert rep["strict_degenerate_count"] == 0
