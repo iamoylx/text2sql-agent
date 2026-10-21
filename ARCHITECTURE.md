@@ -275,7 +275,7 @@ TABLES（DDL+中文注释，进白名单与 Schema 注入）③ 换金标与 few
 
 ### 附录 · 测试与评测
 
-- `tests/`（**152 passed / 2 skipped**，默认口径；干净克隆需先建库）：test_mcp（协议回环+凭据三道防线+启动期黑盒验收）/ test_safety（AST 攻击用例）/ test_writer（三道闸+dry-run）/ test_supervisor（FakeLLM 驱动全图）/ test_cost（成本计量）/ test_init_db（建库脚本）/ test_output_encoding（控制台编码闸门）。**读测试是理解安全边界最快的路径**。两条真 LLM 用例由 `RUN_SLOW=1` 控制，默认 skip。
+- `tests/`（**174 passed / 2 skipped**，收集 176，默认口径；干净克隆需先建库）：test_mcp（协议回环+凭据三道防线+启动期黑盒验收）/ test_safety（AST 攻击用例）/ test_writer（三道闸+dry-run）/ test_supervisor（FakeLLM 驱动全图）/ test_cost（成本计量）/ test_init_db（建库脚本）/ test_output_encoding（控制台编码闸门）/ test_bench_concurrency（压测脚本自身，22 条）。**读测试是理解安全边界最快的路径**。两条真 LLM 用例由 `RUN_SLOW=1` 控制，默认 skip。
 - `evals/`：60 条金标 + 各 Stage 评测脚本与落盘结果（s5_eval_result / s8_dual_result / latency_cost_result），数字全部真实跑出。
 - `scripts/run_api.py`（启动 8501）、`scripts/init_db.py` / `init_db_mysql.py`（数据入库）。
 

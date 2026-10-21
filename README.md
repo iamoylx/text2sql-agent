@@ -63,12 +63,13 @@ system prompt，保证人人问出一致口径。
 | 建库脚本用例 | 11/11 | `tests/test_init_db.py`：缺 CSV 时点名文件 + 指路 Kaggle（而非裸 `FileNotFoundError`） |
 | 服务端导入用例 | 4/4 | `tests/test_server_import.py`：服务自己创建数据目录（镜像首次启动曾因 `sqlite3.connect()` 不建父目录而 `OperationalError`） |
 | 控制台编码闸门 | 6/6 | `tests/test_output_encoding.py`：AST 扫描 print/raise/logging/exit，禁 emoji 与 `¥`(U+00A5)——cp936 编不了，`PYTHONIOENCODING=gbk` 下会崩 |
-| 服务层测试 | pytest **152 passed / 2 skipped**（默认口径；收集 154）<br>`RUN_SLOW=1` + 配好凭据 → **154 passed / 0 skipped** | 工具双保险 + 安全层 + S9 写路径 + S8 Supervisor + S7 MCP + 场景包 + 成本计量 + 建库脚本 + 服务端导入 + 编码闸门 |
+| 压测脚本自身用例 | 22/22 | `tests/test_bench_concurrency.py`：SSE 帧解析（P1 命名事件 / P2 纯 data 两种）、QPS/分位数计算、并发串场判定（**压测脚本也要测**） |
+| 服务层测试 | pytest **174 passed / 2 skipped**（默认口径；收集 176）<br>`RUN_SLOW=1` + 配好凭据 → **176 passed / 0 skipped** | 工具双保险 + 安全层 + S9 写路径 + S8 Supervisor + S7 MCP + 场景包 + 成本计量 + 建库脚本 + 服务端导入 + 编码闸门 + 压测脚本 |
 
 **为什么会有 skip、以及为什么这个数必须可复现**：只有两条真实 LLM 用例会跳过
 （`tests/test_tools.py` 与 `tests/test_mcp.py` 各一条），它们由 `RUN_SLOW=1` **显式开关**控制，
-而不是「看谁机器上碰巧有 API key」——否则同一个仓库在别人机器上是 152/2、在我这儿是 154/0，
-简历写「150 passed」就说不清。现在的口径是：**默认（不带任何环境变量、不配任何 key）＝ 152 passed / 2 skipped，
+而不是「看谁机器上碰巧有 API key」——否则同一个仓库在别人机器上是 174/2、在我这儿是 176/0，
+简历写「150 passed」就说不清。现在的口径是：**默认（不带任何环境变量、不配任何 key）＝ 174 passed / 2 skipped，
 任何机器一致**；要跑全量就 `RUN_SLOW=1`，且需配好凭据（未配则给一条点名变量的 skip，而不是红）。
 其余用例**零外部依赖**：不联网、不读凭据、不需要人工准备数据。
 
@@ -323,7 +324,7 @@ docker compose run --rm --no-deps api python scripts/make_fixture_db.py
 ### 7. 自检（不耗 LLM 额度）
 
 ```bash
-python -m pytest -q                # 默认 152 passed / 2 skipped
+python -m pytest -q                # 默认 174 passed / 2 skipped（收集 176）
 python evals/run_eval_s5.py        # 60 条全量评测（需 LLM，约 ¥0.18）
 python evals/run_selfheal_eval.py  # 自愈专项（需 LLM，约 ¥0.04）
 ```
@@ -333,14 +334,14 @@ python evals/run_selfheal_eval.py  # 自愈专项（需 LLM，约 ¥0.04）
 >
 > **但默认口径**并非「不需准备数据」**——这一点之前写错了，已订正**：
 > 有 10 条用例要碰 `data/db/olist.db`（135 MB，由 Kaggle 数据集建出，`.gitignore` 排除）。
-> 所以准确说法是「任何**建过库**的机器上 152 / 2」。干净克隆实测是
+> 所以准确说法是「任何**建过库**的机器上 174 / 2」。干净克隆实测是
 > **137 passed / 10 failed / 2 skipped**，10 条全因 `sqlite3.OperationalError`。
 >
 > CI 与干净克隆上用合成库补齐（表结构真实、行数合成，够跑通代码路径）：
 >
 > ```bash
 > python scripts/make_fixture_db.py     # 生成 data/db/olist.db（合成，约 22 MB / 2.4s）
-> python -m pytest -q                   # → 152 passed / 2 skipped
+> python -m pytest -q                   # → 174 passed / 2 skipped
 > ```
 >
 > 真实业务基数由 `init_db.py` 的 `EXPECTED` 行数校验与 METRICS.md 负责，**不由单测负责**
