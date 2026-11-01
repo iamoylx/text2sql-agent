@@ -75,24 +75,23 @@ jobs:
         #   `403 Must have admin rights`），于是「CI 红了但看不到是哪个用例红」
         #   会变成一个纯猜测的过程。而 `::error::` 生成的 check annotation 是
         #   公开可读的（GET /check-runs/{id}/annotations 无需鉴权）。
-        #   顺带把实际解析到的依赖版本一起报上去 —— requirements.txt 只有 1 条
-        #   写了 `==`，其余全是 `>=`，每次跑都可能解析出不同版本，
-        #   这是「十天前绿、今天红」的头号嫌疑，得让它自己说出来。
+        #
+        # 为什么压成两条而不是一条一个：注解有条数上限（实测约 10 条，
+        # 超出的被静默丢弃）。第一版的「一条 dep 一个注解」把最要紧的环境指纹
+        # 挤掉了 —— 用一次真运行换来的教训。现在压成「失败摘要」+「依赖版本」两条，
+        # 条数不随失败数增长。
         run: |
           set +e
           python -m pytest -q > /tmp/pytest.log 2>&1
           status=$?
           cat /tmp/pytest.log
           if [ "$status" -ne 0 ]; then
-            grep -E '^(FAILED|ERROR) ' /tmp/pytest.log | head -15 | cut -c1-220 \
-              | while IFS= read -r line; do echo "::error::$line"; done
-            echo "::error::pytest 退出码 $status；下面是本次实际解析到的依赖版本（requirements.txt 几乎全是 >=）"
-            python -m pip freeze 2>/dev/null \
-              | grep -iE '^(langgraph|langchain[^=]*|openai|sqlparse|sqlalchemy|pandas|numpy|pydantic[^=]*|fastapi|uvicorn|sse-starlette|pytest)==' \
-              | while IFS= read -r line; do echo "::error::dep $line"; done
-            # 环境指纹：2026-11-01 出现过「同一份代码一次红一次绿」，两个 job 拿到的是
-            # 不同的 runner 实例（id 1000000037 / 1000000039），而 ubuntu-latest 正在
-            # 迁移到 Ubuntu 26 —— 镜像异构是很难从外部证伪的假设，只能让它自己报。
-            echo "::error::env $(grep -h PRETTY_NAME /etc/os-release 2>/dev/null || echo os=unknown) | $(python -V 2>&1) | nproc=$(nproc)"
+            fails=$(grep -E '^(FAILED|ERROR) ' /tmp/pytest.log | head -5 | cut -c1-160 | paste -sd ';' -)
+            deps=$(python -m pip freeze 2>/dev/null \
+              | grep -iE '^(langgraph|langchain[^=]*|openai|sqlparse|sqlalchemy|pandas|numpy|pydantic[^=]*|fastapi|uvicorn|sse-starlette|mcp)==' \
+              | paste -sd ' ' -)
+            envline="$(grep -h PRETTY_NAME /etc/os-release 2>/dev/null || echo os=unknown) | $(python -V 2>&1) | nproc=$(nproc)"
+            echo "::error::pytest 退出码 $status | $envline | 失败：${fails:-（日志里没有 FAILED 行）}"
+            echo "::error::本次解析到的依赖（requirements.txt 除 mcp 外全是 >=，会漂）：${deps}"
             exit "$status"
           fi
