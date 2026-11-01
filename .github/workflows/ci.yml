@@ -90,5 +90,9 @@ jobs:
             python -m pip freeze 2>/dev/null \
               | grep -iE '^(langgraph|langchain[^=]*|openai|sqlparse|sqlalchemy|pandas|numpy|pydantic[^=]*|fastapi|uvicorn|sse-starlette|pytest)==' \
               | while IFS= read -r line; do echo "::error::dep $line"; done
+            # 环境指纹：2026-11-01 出现过「同一份代码一次红一次绿」，两个 job 拿到的是
+            # 不同的 runner 实例（id 1000000037 / 1000000039），而 ubuntu-latest 正在
+            # 迁移到 Ubuntu 26 —— 镜像异构是很难从外部证伪的假设，只能让它自己报。
+            echo "::error::env $(grep -h PRETTY_NAME /etc/os-release 2>/dev/null || echo os=unknown) | $(python -V 2>&1) | nproc=$(nproc)"
             exit "$status"
           fi
