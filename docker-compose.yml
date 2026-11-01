@@ -51,6 +51,17 @@ services:
     volumes:
       # 真实库 / CSV / 审计日志 / 自定义表注册都在 data/ 下，镜像里一个都不带
       - ./data:/app/data
+      #
+      # ⚠️ 在 Windows + Docker Desktop 上，上面这条绑定挂载会让查询直接超时失败。
+      #    D: 盘经 9p/virtiofs 进容器，SQLite 的随机小读 + fsync 每次都要跨文件系统往返。
+      #    同一条 JOIN+GROUP BY 实测：
+      #        绑定挂载 16.716 s（撞死本项目的 5s SQL 超时，查询必失败）
+      #        容器 ext4 0.118 s                        —— 差 142 倍
+      #    Linux 宿主（含 CI）上没这个问题，所以**不要改这里**；
+      #    本机做法是把热库目录换成命名卷（放仓库外的 override 里）：
+      #        volumes:
+      #          - p2-db:/app/data/db
+      #    其余 data/（raw CSV、schema.md、审计日志）仍走绑定挂载，宿主机照旧可读。
     healthcheck:
       # 用 python 而不是 curl：python:3.12-slim 里没有 curl，为一个健康检查
       # 多装一个包不值当
