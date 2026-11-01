@@ -86,7 +86,11 @@ jobs:
           status=$?
           cat /tmp/pytest.log
           if [ "$status" -ne 0 ]; then
-            fails=$(grep -E '^(FAILED|ERROR) ' /tmp/pytest.log | head -5 | cut -c1-160 | paste -sd ';' -)
+            # 截断长度有讲究：用例自己的断言消息里往往已经带了 stderr 摘录
+            # （例如 test_mcp 的 `assert proc.returncode == 0, proc.stderr[:400]`），
+            # 第一版切到 160 字符，正好把那 400 字符的诊断切没了 —— 只看到
+            # 「降级模式必须能正常起来，否则……」而看不到它为什么没起来。
+            fails=$(grep -E '^(FAILED|ERROR) ' /tmp/pytest.log | head -3 | cut -c1-600 | paste -sd ';' -)
             deps=$(python -m pip freeze 2>/dev/null \
               | grep -iE '^(langgraph|langchain[^=]*|openai|sqlparse|sqlalchemy|pandas|numpy|pydantic[^=]*|fastapi|uvicorn|sse-starlette|mcp)==' \
               | paste -sd ' ' -)
