@@ -69,4 +69,26 @@ jobs:
 
       - name: 测试（默认口径，零外部依赖）
         # 不需要任何 key：真 LLM 用例由 RUN_SLOW=1 显式门控，默认 2 skipped
-        run: python -m pytest -q
+        #
+        # 为什么要自己生成 annotation 而不是直接 `python -m pytest -q`：
+        #   Actions 的原始日志要 admin 权限才下得下来（未授权 API 返回
+        #   `403 Must have admin rights`），于是「CI 红了但看不到是哪个用例红」
+        #   会变成一个纯猜测的过程。而 `::error::` 生成的 check annotation 是
+        #   公开可读的（GET /check-runs/{id}/annotations 无需鉴权）。
+        #   顺带把实际解析到的依赖版本一起报上去 —— requirements.txt 只有 1 条
+        #   写了 `==`，其余全是 `>=`，每次跑都可能解析出不同版本，
+        #   这是「十天前绿、今天红」的头号嫌疑，得让它自己说出来。
+        run: |
+          set +e
+          python -m pytest -q > /tmp/pytest.log 2>&1
+          status=$?
+          cat /tmp/pytest.log
+          if [ "$status" -ne 0 ]; then
+            grep -E '^(FAILED|ERROR) ' /tmp/pytest.log | head -15 | cut -c1-220 \
+              | while IFS= read -r line; do echo "::error::$line"; done
+            echo "::error::pytest 退出码 $status；下面是本次实际解析到的依赖版本（requirements.txt 几乎全是 >=）"
+            python -m pip freeze 2>/dev/null \
+              | grep -iE '^(langgraph|langchain[^=]*|openai|sqlparse|sqlalchemy|pandas|numpy|pydantic[^=]*|fastapi|uvicorn|sse-starlette|pytest)==' \
+              | while IFS= read -r line; do echo "::error::dep $line"; done
+            exit "$status"
+          fi
