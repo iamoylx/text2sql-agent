@@ -20,6 +20,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -660,10 +662,117 @@ def _env_with_placeholder_credentials(provider: str = "deepseek") -> dict:
 
 
 def _run_server_raw(args=(), env=None, timeout: int = 90) -> subprocess.CompletedProcess:
-    """起真子进程、喂完整握手 3 帧、关 stdin 让它自己退出，回收 stdout/stderr/退出码。"""
+    """起真子进程、喂完整握手 3 帧、关 stdin 让它自己退出，回收 stdout/stderr/退出码。
+
+    ⚠ 只给「**启动期**就硬失败」的用例用（进程在读到任何帧之前已退出，不存在在途响应）。
+    健康启动的用例必须用 `_run_server_handshake`——见那里关于 EOF 竞态的说明（2026-11-02）。
+    """
     payload = b"".join(json.dumps(f, ensure_ascii=False).encode() + b"\n" for f in _FRAMES)
     return subprocess.run([sys.executable, str(SERVER), *args],
                           input=payload, capture_output=True, env=env, timeout=timeout)
+
+
+def _run_server_handshake(args=(), env=None, timeout: int = 90) -> subprocess.CompletedProcess:
+    """起真子进程、喂 3 帧握手，**等 id=1 与 id=2 两个响应都到齐后才关 stdin**，回收结果。
+
+    ★ 为什么不再用 `subprocess.run(input=payload)`（2026-11-02 实测定性）
+    旧写法把 3 帧一次性写进 stdin 后**立刻关闭**，等于「客户端发完请求就断连」。这在
+    mcp 1.26.0 的 `stdio_server` 上会制造一个**测试自己引入的竞态**：stdin 一 EOF，
+    读循环立刻结束 → `server.run()` 开始退任务组并关掉写通道；此时若 `tools/list` 的
+    响应还没写出去，handler 就会在 `mcp/shared/session.py:_send_response` →
+    `write_stream.send` 上撞 `anyio.ClosedResourceError`，被 anyio 包成
+    `ExceptionGroup` 抛到顶层 → **退出码 1**。
+
+    实测（同一份代码、同样的依赖版本）：Linux 容器里 10 次跑 **5 次**失败，
+    本机 Windows（proactor 事件循环，时序不同）10 次 0 次失败 → 所以在 CI 上表现为
+    「同一个 commit 有时绿有时红」，而旧断言消息只贴 `stderr[:400]`（开头是 mcp 的
+    rich 日志行），真正的 traceback 在尾巴上，被切掉了。
+
+    **这是测试夹具的缺陷，不是 server 契约的问题**：真实客户端一定等到响应拿到才关连接，
+    不会有「响应在途就 EOF」。修法是让夹具复现真实时序（先等响应、再关 stdin），
+    而不是放宽 `returncode == 0` 这条断言——否则「进程崩溃」这个真缺陷就再也抓不住了。
+
+    顺带说明为什么不能偷懒用「重试到绿」：抖动被藏起来，闸门等于消失。
+    """
+    payload = b"".join(json.dumps(f, ensure_ascii=False).encode() + b"\n" for f in _FRAMES)
+    proc = subprocess.Popen([sys.executable, str(SERVER), *args],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, env=env)
+    out, err = bytearray(), bytearray()
+    answered = threading.Event()
+    seen_ids: set[int] = set()
+    lock = threading.Lock()
+
+    def _drain_stdout():
+        assert proc.stdout is not None
+        for line in proc.stdout:                       # 阻塞读，直到进程退出/管道关闭
+            out.extend(line)
+            try:
+                obj = json.loads(line)
+            except Exception:                          # 脏帧留给断言去抓，这里只管收
+                continue
+            if isinstance(obj, dict) and obj.get("id") in (1, 2):
+                with lock:
+                    seen_ids.add(obj["id"])
+                    if len(seen_ids) == 2:
+                        answered.set()
+
+    def _drain_stderr():
+        assert proc.stderr is not None
+        for chunk in iter(lambda: proc.stderr.read(4096), b""):
+            err.extend(chunk)
+
+    t_out = threading.Thread(target=_drain_stdout, daemon=True)
+    t_err = threading.Thread(target=_drain_stderr, daemon=True)
+    t_out.start()
+    t_err.start()
+    try:
+        assert proc.stdin is not None
+        try:
+            proc.stdin.write(payload)
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass                                       # 启动期就硬失败时管道已关，属预期
+        deadline = time.monotonic() + timeout
+        while not answered.is_set():
+            if proc.poll() is not None:                # 进程自己退了（失败路径）
+                break
+            if time.monotonic() > deadline:
+                proc.kill()
+                raise subprocess.TimeoutExpired(proc.args, timeout)
+            time.sleep(0.01)
+        try:
+            proc.stdin.close()                         # 现在才关：没有在途响应
+        except (BrokenPipeError, OSError):
+            pass
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            raise
+    finally:
+        t_out.join(timeout=10)
+        t_err.join(timeout=10)
+    return subprocess.CompletedProcess(proc.args, proc.returncode, bytes(out), bytes(err))
+
+
+def _proc_diag(proc: subprocess.CompletedProcess, *, tail: int = 1500) -> str:
+    """子进程契约失败时的**完整**诊断（2026-11-02）。
+
+    为什么不能只贴 `proc.stderr[:400]`：进程非零退出的原因在 stderr 的**尾巴**（traceback），
+    开头只有 mcp 自己的 rich 日志行。CI 上就吃过这个亏——注解里只看到
+    「INFO Processing request of type ... server.py:720」，真正炸在哪儿被 `[:400]` 切掉了。
+
+    为什么要把换行压成一行：pytest 的短摘要里 `FAILED ... - <assert 消息>` 是**单行**的，
+    多行消息会被 `grep '^FAILED'` 只截到第一行；再经 CI 的注解通道（`::error::`）转义后
+    更没法看。压成一行 + `⏎` 标记断点，信息不丢且可检索。
+    """
+    err = proc.stderr.decode("utf-8", "replace")
+    out = proc.stdout.decode("utf-8", "replace")
+    flat = lambda s: s.replace("\r\n", "\n").replace("\n", " ⏎ ")
+    return (f"rc={proc.returncode} | stderr({len(err)}B) 尾巴 {tail}: {flat(err[-tail:])} "
+            f"| stdout({len(out)}B) 尾巴 300: {flat(out[-300:])}")
 
 
 def _tool_names(proc: subprocess.CompletedProcess) -> list[str]:
@@ -698,9 +807,9 @@ def test_stdio_stdout_is_protocol_only_when_healthy():
     这条是 stdio 传输的命门——任何一句 print 混进 stdout，客户端都会解析失败/断连。
     所以诊断一律 stderr（`_startup_credential_check` 里全部 print(file=sys.stderr)）。
     """
-    proc = _run_server_raw(env=_env_with_placeholder_credentials())
+    proc = _run_server_handshake(env=_env_with_placeholder_credentials())
 
-    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")[:400]
+    assert proc.returncode == 0, _proc_diag(proc)
     raw = proc.stdout.decode("utf-8", "replace")
     lines = [l for l in raw.splitlines() if l.strip()]
     assert lines, "stdout 一个帧都没有，说明服务根本没应答"
@@ -720,15 +829,17 @@ def test_allow_degraded_starts_with_only_three_tools_and_warns():
 
     这是「不暴露工具」唯一合法的用法：显式声明降级，且 stderr 留了声音。
     """
-    proc = _run_server_raw(args=("--allow-degraded",), env=_env_without_credentials())
+    proc = _run_server_handshake(args=("--allow-degraded",), env=_env_without_credentials())
 
-    assert proc.returncode == 0, "降级模式必须能正常起来，否则 --allow-degraded 没意义"
+    assert proc.returncode == 0, \
+        f"降级模式必须能正常起来，否则 --allow-degraded 没意义 | {_proc_diag(proc)}"
     names = _tool_names(proc)
     assert "generate_sql" not in names, "缺凭据时不该把用不了的工具暴露给客户端"
     assert sorted(names) == sorted(["execute_readonly_sql", "compute_metric", "render_chart"]), \
         f"其余 3 个工具必须照常在（它们不需要 LLM），实际：{names}"
     err = proc.stderr.decode("utf-8", "replace")
-    assert "WARN" in err and "DEEPSEEK_API_KEY" in err, f"降级必须留声，实际：{err[:300]}"
+    assert "WARN" in err and "DEEPSEEK_API_KEY" in err, \
+        f"降级必须留声，实际：{_proc_diag(proc)}"
 
 
 def test_build_server_is_the_only_construction_path(monkeypatch):
@@ -768,6 +879,6 @@ def test_import_entry_does_not_die_and_stays_fail_closed():
     proc = subprocess.run([sys.executable, "-c", code], cwd=str(ROOT), env=env,
                           capture_output=True, timeout=90)
 
-    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")[:300]
+    assert proc.returncode == 0, _proc_diag(proc)
     assert proc.stdout.strip() == b"", "import 入口也不许污染 stdout"
     assert "tools= 3" in proc.stderr.decode("utf-8", "replace"), "缺凭据时必须是 fail-closed 的 3 工具"

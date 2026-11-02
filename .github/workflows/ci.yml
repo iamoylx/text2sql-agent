@@ -86,11 +86,13 @@ jobs:
           status=$?
           cat /tmp/pytest.log
           if [ "$status" -ne 0 ]; then
-            # 截断长度有讲究：用例自己的断言消息里往往已经带了 stderr 摘录
-            # （例如 test_mcp 的 `assert proc.returncode == 0, proc.stderr[:400]`），
-            # 第一版切到 160 字符，正好把那 400 字符的诊断切没了 —— 只看到
-            # 「降级模式必须能正常起来，否则……」而看不到它为什么没起来。
-            fails=$(grep -E '^(FAILED|ERROR) ' /tmp/pytest.log | head -3 | cut -c1-600 | paste -sd ';' -)
+            # 截断长度有讲究：用例自己的断言消息里往往已经带了完整诊断
+            # （`test_mcp` 的 `_proc_diag()` 会给出 rc + stderr 尾巴 + stdout 尾巴）。
+            # 第一版切到 160 字符，正好把诊断切没了 —— 只看到「降级模式必须能正常起来，
+            # 否则……」而看不到它为什么没起来。现在 3000：够放下一整段 traceback。
+            # 注意 `_proc_diag()` 刻意把多行压成一行：`grep '^FAILED'` 只认单行摘要，
+            # 多行断言消息会被截到第一行，而 traceback 恰恰在后面。
+            fails=$(grep -E '^(FAILED|ERROR) ' /tmp/pytest.log | head -3 | cut -c1-3000 | paste -sd ';' -)
             deps=$(python -m pip freeze 2>/dev/null \
               | grep -iE '^(langgraph|langchain[^=]*|openai|sqlparse|sqlalchemy|pandas|numpy|pydantic[^=]*|fastapi|uvicorn|sse-starlette|mcp)==' \
               | paste -sd ' ' -)
