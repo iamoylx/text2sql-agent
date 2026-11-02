@@ -1,0 +1,108 @@
+# 依赖锁定（2026-11-02）
+#
+# 来源：干净的 Linux + Python 3.12 环境里执行
+#     python -m pip install --no-cache-dir -r requirements.txt
+# 得到的确切解析结果；随后用**这一套依赖**跑过：
+#   · 全量 pytest：187 passed / 2 skipped（与本机 Windows 口径一致）
+#   · tests/test_mcp.py 里两条 stdio 子进程用例重复 10 次：10/10 通过
+#
+# 用法（CI）：python -m pip install -r requirements.txt -c constraints.txt ruff
+#
+# 为什么要锁（不是洁癖，是真红过）：
+#   requirements.txt 里除 mcp 外全是 `>=`，CI 每次跑都重新解析。2026-11-01 一次
+#   **纯文档提交**（209ed02，只改 docker-compose 注释）让 CI 由绿转红 —— 代码一行没动，
+#   是 pip 当天解析到的传递依赖变了（langchain-core 1.4.8→1.7.3、pandas 2.3.2→3.1.0、
+#   pydantic 2.12.5→2.14.2、anyio 4.12→4.16 …），改变了 mcp stdio 关停的时序，
+#   把一条**本来就带竞态**的用例稳定地照了出来（同一次运行里失败率约 50%）。
+#   结论：CI 的绿不能依赖「今天 PyPI 解析到什么」。
+#
+# 升级流程（三步都要做，缺一不可）：
+#   ① 改 requirements.txt 的范围；② 在干净 Linux py3.12 环境重新解析并更新本文件；
+#   ③ 全量 pytest + test_mcp 的两条 stdio 用例重复跑 10 次，绿了再提交。
+#   不要只改本文件里的单个 pin：单点升级正是「解析结果漂移」的来源。
+#
+# 说明：本文件只约束 CI 与本机复现；requirements.txt 的版本范围仍是「支持区间」的
+# 书面说明，两者不一致时以本文件为准（并把两者一起更新）。
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.16.0
+attrs==26.1.0
+certifi==2026.10.23
+cffi==2.1.1
+charset-normalizer==3.5.2
+click==8.5.0
+cryptography==50.0.2
+distro==1.9.0
+fakeredis==2.40.0
+fastapi==0.162.0
+h11==0.16.0
+httpcore==1.0.9
+httpcore2==2.16.0
+httpx==0.28.1
+httpx-sse==0.4.3
+httpx2==2.16.0
+idna==3.20
+iniconfig==2.3.1
+jiter==0.18.0
+jsonpatch==1.39
+jsonpointer==3.7
+jsonschema==4.26.0
+jsonschema-specifications==2025.9.1
+langchain-core==1.7.3
+langchain-openai==1.7.3
+langchain-protocol==0.0.20
+langgraph==1.2.19
+langgraph-checkpoint==4.3.1
+langgraph-prebuilt==1.1.1
+langgraph-sdk==0.4.11
+langsmith==0.14.17
+markdown-it-py==4.2.0
+mcp==1.26.0
+mdurl==0.1.2
+numpy==2.5.4
+openai==2.54.0
+opentelemetry-api==1.45.2
+orjson==3.13.0
+ormsgpack==1.13.0
+packaging==26.3
+pandas==3.1.0
+pluggy==1.7.0
+pycparser==3.12
+pydantic==2.14.2
+pydantic-settings==2.16.2
+pydantic_core==2.50.2
+Pygments==2.21.0
+PyJWT==2.15.1
+PyMySQL==1.2.3
+pytest==9.2.0
+python-dateutil==4.0.0
+python-dotenv==1.2.4
+python-multipart==0.0.33
+PyYAML==6.0.3
+redis==8.1.0
+referencing==0.37.0
+regex==2026.9.29
+requests==2.34.2
+requests-toolbelt==1.0.0
+rich==15.0.0
+rpds-py==2026.9.1
+ruff==0.17.3
+sniffio==1.3.1
+sortedcontainers==2.4.0
+SQLAlchemy==2.1.6
+sqlparse==0.6.1
+sse-starlette==3.6.0
+starlette==1.10.0
+tenacity==9.2.1
+tiktoken==0.14.0
+tqdm==4.70.1
+truststore==0.10.5
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+tzdata==2026.6
+urllib3==2.8.0
+uuid_utils==0.19.0
+uvicorn==0.54.0
+websockets==17.4
+xxhash==4.0.2
+zstandard==0.25.0

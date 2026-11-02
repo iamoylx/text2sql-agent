@@ -55,11 +55,17 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-          cache-dependency-path: requirements.txt
+          # constraints.txt 也进缓存 key：锁定文件变了就该重新装，否则缓存会骗人
+          cache-dependency-path: |
+            requirements.txt
+            constraints.txt
 
       - name: 安装依赖
-        # ruff 是可选的开发依赖，没有进 requirements.txt（那里面只放运行时依赖）
-        run: pip install -r requirements.txt ruff
+        # ① ruff 是可选的开发依赖，没有进 requirements.txt（那里面只放运行时依赖）
+        # ② `-c constraints.txt` 把**传递依赖**一起钉死：requirements.txt 里除 mcp 外
+        #    全是 `>=`，不锁的话每次 CI 解析到的版本都可能不同 —— 2026-11-01 一次纯文档
+        #    提交就让 CI 由绿转红，正是解析漂移把一条本来带竞态的用例稳定照出来的结果。
+        run: pip install -r requirements.txt -c constraints.txt ruff
 
       - name: Lint（真实缺陷类规则，不打架格式风格）
         run: ruff check --select E9,F63,F7,F82,F401,F811,F841,F821,F822,F823 .
@@ -98,6 +104,6 @@ jobs:
               | paste -sd ' ' -)
             envline="$(grep -h PRETTY_NAME /etc/os-release 2>/dev/null || echo os=unknown) | $(python -V 2>&1) | nproc=$(nproc)"
             echo "::error::pytest 退出码 $status | $envline | 失败：${fails:-（日志里没有 FAILED 行）}"
-            echo "::error::本次解析到的依赖（requirements.txt 除 mcp 外全是 >=，会漂）：${deps}"
+            echo "::error::本次安装的依赖（已按 constraints.txt 锁定；若与提交里的锁定文件不符，说明解析漂了）：${deps}"
             exit "$status"
           fi

@@ -2,6 +2,11 @@
 # torch 2.7.1+cu126 由系统环境继承——P2 SQL Agent 不需要本地向量模型，
 # Few-shot 示例检索用轻量 TF 关键词相似度（src/agent/fewshot.py），库规模上千后
 # 可无痛切换 BGE-M3 编码，检索器接口签名不变）
+#
+# ★ 这里的 `>=` 只表达**支持区间**；实际安装版本由 constraints.txt 锁定，CI 用
+#   `pip install -r requirements.txt -c constraints.txt ruff`。不锁的后果实测过：
+#   2026-11-01 一次纯文档提交让 CI 由绿转红（传递依赖漂移改了 mcp stdio 关停时序）。
+#   升级依赖时两个文件一起改，并按 constraints.txt 头部写的三步回归。
 langgraph>=1.2.0
 langchain-openai>=1.3.0
 openai>=2.26.0,<3.0.0
