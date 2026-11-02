@@ -1401,3 +1401,123 @@ P2 侧同一条命令修前修后差 **400 倍**：
 2. **闭循环替代信号量**：`t0` 记在抢信号量之前，`wall_ms` 混进排队时间。
 3. **共享 `AsyncClient`**：Windows 上每个新建 client 首次连接 ~520ms 且互相串行化，
    10 并发下独立 client 墙钟 5836ms vs 共享连接池 **24ms**（240 倍）。
+
+## T1-补 · CI 间歇红：不是依赖漂移，是测试自己造的竞态（2026-11-02）
+
+### 现象
+
+2026-11-01 起 CI 开始间歇性红，而且**红的用例在两条之间摇摆**：
+
+| run | commit | 失败的用例 | 该 commit 是否改过代码 |
+|---|---|---|---|
+| #9 | `209ed02` | （注解还没加，只知道红） | **没有**，只改 docker-compose 注释 |
+| #10 | `43b6704` | **绿** | 只加 CI 注解 |
+| #11 | `d84895b` | `test_stdio_stdout_is_protocol_only_when_healthy` | 只加 CI 注解 |
+| #12 | `4bfcd3a` | `test_allow_degraded_starts_with_only_three_tools_and_warns` | 只加 CI 注解 |
+| #13 | `256406e` | `test_stdio_stdout_is_protocol_only_when_healthy` | 只加 CI 注解 |
+
+「纯文档提交让 CI 由绿转红」+「同一份代码一次绿一次红」= 要么依赖漂移，要么用例有竞态。
+当时的假设是前者（`requirements.txt` 除 mcp 外全是 `>=`）。
+
+### 先证伪「依赖漂移」
+
+本机新建干净 venv 从 `requirements.txt` 重新解析，**拿到的就是 CI 那一套**：
+
+| 包 | 本地旧 venv（10-21 验证时） | 干净 venv / CI 今天的解析结果 |
+|---|---|---|
+| langchain-core | 1.4.8 | **1.7.3** |
+| langchain-openai | 1.3.3 | **1.7.3** |
+| langgraph | 1.2.6 | 1.2.19 |
+| pandas | 2.3.2 | **3.1.0（大版本）** |
+| pydantic | 2.12.5 | **2.14.2** |
+| anyio | 4.12.1 | **4.16.0** |
+| mcp | 1.26.0 | 1.26.0（锁死的，没漂） |
+
+在这套**与 CI 完全相同**的版本下，本机全量 `pytest` 是 **187 passed / 2 skipped**（与基线一致）
+→ **漂移解释不了红**。假设到此被证伪，剩下的只能是平台相关的时序。
+
+### 定性：把 CI 环境搬到本地容器，竞态立刻复现
+
+`python:3.12-slim`（Python 3.12.16，与 CI 的 3.12.15 同小版本线）里装同一组依赖，
+把两条 stdio 用例重复 10 次：**5 次失败 / 5 次通过**。同一个仓库、同一套依赖、同一个 commit ——
+唯一变量是操作系统（Linux epoll vs Windows proactor），**这就是竞态的定义**。
+
+失败时的真实 traceback（`_proc_diag()` 从 stderr **尾巴**取到，这才是之前看不到的部分）：
+
+```
+ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)
++-+---------------- 1 ----------------
+  |   File "mcp/server/lowlevel/server.py", line 696, in _handle_message
+  |     await self._handle_request(message, req, session, lifespan_context, raise_exceptions)
+  |   File "mcp/server/lowlevel/server.py", line 781, in _handle_request
+  |     await message.respond(response)
+  |   File "mcp/shared/session.py", line 349, in _send_response
+  |     await self._write_stream.send(session_message)
+  |   File "anyio/streams/memory.py", line 289, in send
+  |     raise ClosedResourceError from None
+  | anyio.ClosedResourceError
+  +------------------------------------
+```
+
+### 机制：夹具把「客户端断连」演成了「响应在途时 EOF」
+
+旧夹具是 `subprocess.run(input=payload)`：3 帧写完 **stdin 立刻被关掉**。而
+`mcp/server/stdio.py` 的读循环一收到 EOF 就会退出，`server.run()` 随之退任务组、关掉写通道；
+此时 `tools/list` 的响应可能还在路上，于是 handler 在 `_send_response` 上撞
+`anyio.ClosedResourceError`，被 anyio 包成 `ExceptionGroup` 抛到顶层 → **退出码 1**，
+断言 `proc.returncode == 0` 红。
+
+**这是夹具缺陷，不是 server 契约问题**：真实客户端一定等到响应拿到才关连接，
+不存在「响应在途就 EOF」；把这条当成产品缺陷去修 server，会修错地方。
+反过来说，也**不能放宽断言**（`returncode in (0, 1)`）或加重试 —— 那等于把「进程崩溃」
+这个真缺陷一起放掉，闸门就消失了。
+
+### 修法
+
+1. **`_run_server_handshake()`**（新）：`Popen` 起真进程 → 写 3 帧 → 两个排空线程收
+   stdout/stderr → **等 `id=1`/`id=2` 两个响应都到齐后再关 stdin**，复现真实客户端时序；
+   进程提前退出/管道已关/超时都有兜底。断言仍是「退出码 0 + stdout 逐行合法 JSON-RPC」。
+2. **`_proc_diag()`**（新）：失败时给出 `rc + stderr 尾巴 1500B + stdout 尾巴 300B`，
+   并把换行压成一行。两个理由都是踩过的：① traceback 在 stderr **尾巴**，`stderr[:400]`
+   只会贴出开头的 mcp rich 日志行；② `grep '^FAILED'` 与 CI 注解通道都只认**单行**，
+   多行断言消息会被截到第一行——而关键信息恰在后面。
+3. **CI 注解截断 600 → 3000 字符**：够放下一整段 traceback。
+
+### 回归（全部真跑）
+
+| 口径 | 改前 | 改后 |
+|---|---|---|
+| 两条 stdio 用例 ×10（Linux 容器） | **5 失败 / 5 通过** | **10 / 10 通过** |
+| 全量 `pytest`（Linux 容器，CI 等价） | 187 passed / 2 skipped（偶发红） | 连跑 4 次 **187 passed / 2 skipped** 稳定 |
+| 全量 `pytest`（本机 Windows） | 187 passed / 2 skipped | 187 passed / 2 skipped |
+| `ruff`（CI 那套规则） | All checks passed | All checks passed |
+| GitHub Actions | run #9、#11–#13 红（#10 偶绿） | run **#14** CI + **#8** Docker（`a915b4e`）双绿 |
+
+### 顺带把「依赖漂移」这条路堵死：`constraints.txt`
+
+竞态虽然与版本无关，但「CI 的绿依赖当天 PyPI 解析到什么」仍然是真风险：上面 run #9
+就是**代码没动、CI 变红**。所以新增 `constraints.txt`（在干净 Linux py3.12 环境实测解析出的
+确切版本集），CI 改成：
+
+```bash
+pip install -r requirements.txt -c constraints.txt ruff
+```
+
+`requirements.txt` 里的 `>=` 保留为「支持区间」的书面说明。验证方式不是「看起来对」：
+
+- 在**全新**容器里用带 `-c` 的命令安装 → `pip freeze` 与 `constraints.txt` 排序后 **逐行 IDENTICAL**；
+- 用这套锁定的依赖跑全量 3 次：187 passed / 2 skipped；`ruff` All checks passed；
+- 缓存 key 把 `constraints.txt` 也纳入（`cache-dependency-path` 两行），否则锁定文件变了缓存会骗人。
+
+### 方法论（这节最值得带走的）
+
+1. **「新版本导致」是最顺手的假设，但只能当假设**：本地装同一组版本跑一遍就能证伪，
+   成本十分钟，比在 CI 里盯着红绿猜快得多。
+2. **抖动用例不能靠重试变绿**：重试把「有 50% 概率崩」变成「CI 看着是绿的」，
+   闸门从「抓缺陷」退化成「掷骰子」。
+3. **断言消息的位置和内容一样重要**：贴 `stderr[:400]` 贴到的是日志不是 traceback；
+   把多行消息塞进 `grep`/注解这类单行通道，等于自断诊断。这次两个坑一起修了。
+4. **本地绿 ≠ CI 绿，这次输在事件循环，不是版本**：此前那次是依赖没锁（`T1`），
+   这次是平台时序。同一句话的两种成因——所以「CI 红了」永远要落到**机制**上才算完。
+5. **可复现的绿才叫绿**：修完竞态仍然把依赖锁上，因为「下一个纯文档提交把 CI 弄红」
+   这件事与竞态是否存在无关。
